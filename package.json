@@ -1,0 +1,84 @@
+{
+  "name": "node-nutrunner-open-library",
+  "version": "1.0.0",
+  "description": "Production-grade Atlas Copco Open Protocol client for Node.js. Handles nutrunner communication, tightening cycles, VIN traceability, batch manufacturing, and industrial safety interlocks. Supports Atlas Copco, Stanley, Desoutter, and Ingersoll Rand controllers.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "scripts": {
+    "start": "node examples/01-basic-tightening.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hj91/node-nutrunner-open-library.git"
+  },
+  "keywords": [
+    "open-protocol",
+    "atlas-copco",
+    "desoutter",
+    "stanley",
+    "ingersoll-rand",
+    "nutrunner",
+    "torque-controller",
+    "torque-tool",
+    "tightening",
+    "iiot",
+    "scada",
+    "mes",
+    "manufacturing",
+    "industrial-automation",
+    "plc",
+    "opcua",
+    "traceability",
+    "vin",
+    "batch-manufacturing",
+    "powerfocus",
+    "powermacs",
+    "qx-series",
+    "cvi-controller",
+    "mid0061",
+    "mid0065",
+    "mid0101",
+    "assembly-line",
+    "automotive",
+    "aerospace"
+  ],
+  "author": {
+    "name": "Harshad Joshi",
+    "email": "harshad@bufferstack.io",
+    "url": "https://github.com/hj91"
+  },
+  "contributors": [
+    {
+      "name": "Bufferstack.IO Analytics Technology LLP",
+      "url": "https://bufferstack.io"
+    }
+  ],
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/hj91/node-nutrunner-open-library/issues"
+  },
+  "homepage": "https://github.com/hj91/node-nutrunner-open-library#readme",
+  "files": [
+    "index.js",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "examples/"
+  ],
+  "dependencies": {},
+  "optionalDependencies": {
+    "@influxdata/influxdb-client": "^1.35.0",
+    "node-opcua": "^2.129.0",
+    "mqtt": "^5.10.1"
+  },
+  "directories": {
+    "example": "examples",
+    "doc": "docs"
+  },
+  "funding": {
+    "type": "individual",
+    "url": "https://github.com/sponsors/hj91"
+  }
+}
