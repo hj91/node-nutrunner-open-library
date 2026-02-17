@@ -1,6 +1,6 @@
 {
   "name": "node-nutrunner-open-library",
-  "version": "1.0.1",
+  "version": "1.0.4",
   "description": "Production-grade Atlas Copco Open Protocol client for Node.js. Handles nutrunner communication, tightening cycles, VIN traceability, batch manufacturing, and industrial safety interlocks. Supports Atlas Copco, Stanley, Desoutter, and Ingersoll Rand controllers.",
   "main": "index.js",
   "engines": {
