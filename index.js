@@ -21,7 +21,6 @@
  * limitations under the License.
  */
 
-
 'use strict';
 
 const net = require('net');
@@ -319,7 +318,22 @@ class OpenProtocolNutrunner extends EventEmitter {
     }
     
     const midStr = mid.toString().padStart(4, '0');
-    const body = `MID${midStr}${payload}`;
+    
+    // Standard Header Construction (12 chars after MID)
+    // Rev(3) NoAck(1) Station(2) Spindle(2) Spare(4)
+    const rev = '001';
+    // NoAck Flag: '0' = Ack Required (Default), '1' = No Ack
+    // If expectAck is TRUE, we send '0' (Please Ack).
+    // If expectAck is FALSE, we send '1' (Don't Ack).
+    // NOTE: This logic is inverted in the protocol spec (0=Ack, 1=NoAck)
+    const noAck = expectAck ? '0' : '1'; 
+    const station = '01';
+    const spindle = '01';
+    const spare = '    ';
+
+    const headerRest = `${rev}${noAck}${station}${spindle}${spare}`;
+    const body = `${midStr}${headerRest}${payload}`;
+    
     const len = (body.length + 4).toString().padStart(4, '0');
     
     if (expectAck) {
@@ -342,7 +356,8 @@ class OpenProtocolNutrunner extends EventEmitter {
 
   _onData(data) {
     this._touchTraffic();
-    this.buffer += data.toString();
+    // Clean null terminators (common in simulators/TCP streams)
+    this.buffer += data.toString().replace(/\0/g, '');
 
     while (this.buffer.length >= 4) {
       const lenStr = this.buffer.slice(0, 4);
@@ -372,16 +387,9 @@ class OpenProtocolNutrunner extends EventEmitter {
       const frame = this.buffer.slice(4, len);
       this.buffer = this.buffer.slice(len);
 
-      if (this.validateFrames && !frame.startsWith('MID')) {
-        this.emit('frameError', { 
-          type: 'missing_mid_header', 
-          frame: frame.slice(0, 20) 
-        });
-        continue;
-      }
-
-      const mid = parseInt(frame.slice(3, 7), 10);
-      const payload = frame.slice(7);
+      const mid = parseInt(frame.slice(0, 4), 10); // Standard offset: 0
+      // Standard Payload starts at index 16 (4 MID + 12 Header)
+      const payload = frame.slice(16);
 
       try {
         const parsed = this._parseMID(mid, payload);
@@ -400,7 +408,7 @@ class OpenProtocolNutrunner extends EventEmitter {
     switch (mid) {
 
       case 2: // Comm start ACK (some controllers use MID 2 instead of 3)
-      case 3:
+      case 3: // Comm start ACK
         // Safely parse revision, handle padding/whitespace
         const revStr = p.slice(0, 2).trim();
         const revision = parseInt(revStr, 10);
