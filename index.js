@@ -1,20 +1,17 @@
 /**
- * Open Protocol Nutrunner Client (node-nutrunner-open-library) 
- * 
- * Production-grade Atlas Copco Open Protocol client for Node.js
+ * Open Protocol Nutrunner Client v1.0.4 (node-nutrunner-open-library) 
+ * * Production-grade Atlas Copco Open Protocol client for Node.js
  * Handles nutrunner communication, tightening cycles, VIN traceability,
  * batch manufacturing, and industrial safety interlocks.
- * 
+ *
  * Copyright (c) 2026 Bufferstack.IO Analytics Technology LLP
- * Copyright (c) 2025 Harshad Joshi
- * 
+ * Copyright (c) 2026 Harshad Joshi
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
- *     http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
+ * * http://www.apache.org/licenses/LICENSE-2.0
+ * * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
@@ -493,8 +490,8 @@ class OpenProtocolNutrunner extends EventEmitter {
   _parse0061(p) {
     const rev = this.state.protocol.revision;
 
+    // --- REVISION 1 (Basic) ---
     if (rev === 1) {
-      // Rev 1: Use status flags, not hard-coded OK position
       const torqueStatus = p[22];
       const angleStatus = p[23];
       
@@ -508,8 +505,52 @@ class OpenProtocolNutrunner extends EventEmitter {
         ok: torqueStatus === '1' && angleStatus === '1'
       };
     }
+    
+    // --- REVISION 4 (Advanced - Per Official Spec R 2.16.0 Table 101) ---
+    if (rev === 4) {
+      return {
+        // Controller identification (0-30)
+        cellId: Number(p.slice(0, 4)),
+        channelId: Number(p.slice(4, 6)),
+        controllerName: p.slice(6, 31).trim(),
+        
+        // Traceability (31-70)
+        vin: p.slice(31, 56).trim(),
+        jobId: Number(p.slice(56, 60)),
+        paramSetId: Number(p.slice(60, 63)),
+        batchSize: Number(p.slice(63, 67)),
+        batchCounter: Number(p.slice(67, 71)),
+        
+        // Status flags (71-73)
+        ok: p[71] === '1',
+        torqueStatus: p[72],
+        angleStatus: p[73],
+        
+        // Torque data (74-97) - Nm × 0.01
+        torqueMin: Number(p.slice(74, 80)) / 100,
+        torqueMax: Number(p.slice(80, 86)) / 100,
+        torqueTarget: Number(p.slice(86, 92)) / 100,
+        torque: Number(p.slice(92, 98)) / 100,
+        
+        // Angle data (98-117) - degrees
+        angleMin: Number(p.slice(98, 103)),
+        angleMax: Number(p.slice(103, 108)),
+        angleTarget: Number(p.slice(108, 113)),
+        angle: Number(p.slice(113, 118)),
+        
+        // Timestamps and unique ID (118-167)
+        timestamp: p.slice(118, 137),        // YYYY-MM-DD:HH:MM:SS
+        lastPsetChange: p.slice(137, 156),   // When pset was last modified
+        batchStatus: p[156],                 // Batch OK/NOK
+        tighteningId: p.slice(157, 167),     // 10-digit unique result ID
+        
+        // Rev 4 doesn't include spindle number in MID 61
+        spindle: 1
+      };
+    }
 
-    // Rev 2+: Parse using status flags at known positions
+    // --- REVISION 2 & 3 (Legacy Traceability) ---
+    // Default fallback for Rev 2 and 3
     const spindleNum = Number(p.slice(10, 12)) || 1;
     const torqueStatus = p.charAt(42) || '0';
     const angleStatus = p.charAt(43) || '0';
