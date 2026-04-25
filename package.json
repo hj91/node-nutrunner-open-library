@@ -1,13 +1,21 @@
 {
   "name": "node-nutrunner-open-library",
-  "version": "1.0.4",
+  "version": "1.1.1",
   "description": "Production-grade Atlas Copco Open Protocol client for Node.js. Handles nutrunner communication, tightening cycles, VIN traceability, batch manufacturing, and industrial safety interlocks. Supports Atlas Copco, Stanley, Desoutter, and Ingersoll Rand controllers.",
+  "type": "commonjs",
   "main": "index.js",
+  "exports": {
+    ".": {
+      "require": "./index.js",
+      "default": "./index.js"
+    }
+  },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=18.0.0"
   },
   "scripts": {
-    "start": "node examples/01-basic-tightening.js"
+     "test": "echo \"No tests yet\" && exit 0",
+     "start": "node examples/01-basic-tightening.js"
   },
   "repository": {
     "type": "git",
@@ -64,18 +72,17 @@
     "index.js",
     "LICENSE",
     "README.md",
-    "CHANGELOG.md",
+    "Changelog.md",
     "examples/"
   ],
   "dependencies": {},
-  "optionalDependencies": {
+  "devDependencies": {
     "@influxdata/influxdb-client": "^1.35.0",
     "node-opcua": "^2.129.0",
     "mqtt": "^5.10.1"
   },
   "directories": {
-    "example": "examples",
-    "doc": "docs"
+    "example": "examples"
   },
   "funding": {
     "type": "individual",
