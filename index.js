@@ -1,5 +1,5 @@
 /**
- * Open Protocol Nutrunner Client v1.0.4 (node-nutrunner-open-library) 
+ * Open Protocol Nutrunner Client v1.1.1 (node-nutrunner-open-library) 
  * * Production-grade Atlas Copco Open Protocol client for Node.js
  * Handles nutrunner communication, tightening cycles, VIN traceability,
  * batch manufacturing, and industrial safety interlocks.
@@ -64,6 +64,46 @@ const RECONNECT_MAX_DELAY_MS = 30000;
 const RECONNECT_BACKOFF_FACTOR = 2;
 const COMMAND_TIMEOUT_MS = 5000;
 const FRAME_VALIDATION_ENABLED = true;
+
+/* =========================================================
+   Brand Profiles
+   MID assignments vary by manufacturer. Specify `brand` in
+   the constructor to pick a profile, or override individual
+   MIDs via jobSelectMid / toolEnableMid / toolDisableMid /
+   maxRevision constructor options.
+========================================================= */
+
+const BRAND_PROFILES = {
+  // Atlas Copco PowerFocus / PowerMACS
+  'atlas-copco': {
+    jobSelectMid:   38,  // MID 0038 = Select Job
+    toolEnableMid:  43,  // MID 0043 = Enable Tool
+    toolDisableMid: 42,  // MID 0042 = Disable Tool
+    maxRevision:     4   // highest MID 0061 revision to request
+  },
+  // Stanley Assembly Technologies
+  'stanley': {
+    jobSelectMid:   34,
+    toolEnableMid:  43,
+    toolDisableMid: 42,
+    maxRevision:     2
+  },
+  // Desoutter Industrial Tools
+  'desoutter': {
+    jobSelectMid:   38,
+    toolEnableMid:  43,
+    toolDisableMid: 42,
+    maxRevision:     4
+  },
+  // Ingersoll Rand
+  'ingersoll-rand': {
+    jobSelectMid:   34,
+    toolEnableMid:  43,
+    toolDisableMid: 42,
+    maxRevision:     2
+  }
+};
+
 
 /* =========================================================
    State Factory
@@ -144,11 +184,17 @@ function createInitialState() {
 class OpenProtocolNutrunner extends EventEmitter {
   constructor({ 
     host, 
-    port = DEFAULT_PORT,
-    autoReconnect = true,
-    validateFrames = FRAME_VALIDATION_ENABLED,
-    spindleCount = null, // Override for controllers without MID 101
-    allowDuplicateCommands = false // Set true to disable one-per-MID enforcement
+    port             = DEFAULT_PORT,
+    autoReconnect    = true,
+    validateFrames   = FRAME_VALIDATION_ENABLED,
+    spindleCount     = null,   // Override for controllers without MID 101
+    allowDuplicateCommands = false, // Set true to disable one-per-MID enforcement
+    brand            = 'generic',      // Controller brand — selects MID profile; 'generic' = spec-default
+    // Per-option overrides: take precedence over brand profile
+    jobSelectMid     = null,
+    toolEnableMid    = null,
+    toolDisableMid   = null,
+    maxRevision      = null    // Highest MID 0061 revision to request
   }) {
     super();
     this.host = host;
@@ -157,6 +203,16 @@ class OpenProtocolNutrunner extends EventEmitter {
     this.validateFrames = validateFrames;
     this.configuredSpindleCount = spindleCount;
     this.allowDuplicateCommands = allowDuplicateCommands;
+
+    // Resolve brand profile then apply any per-option overrides
+    const baseProfile = BRAND_PROFILES[brand] || BRAND_PROFILES['generic'];
+    this.profile = {
+      jobSelectMid:   jobSelectMid   !== null ? jobSelectMid   : baseProfile.jobSelectMid,
+      toolEnableMid:  toolEnableMid  !== null ? toolEnableMid  : baseProfile.toolEnableMid,
+      toolDisableMid: toolDisableMid !== null ? toolDisableMid : baseProfile.toolDisableMid,
+      maxRevision:    maxRevision    !== null ? maxRevision    : baseProfile.maxRevision
+    };
+    this._pendingRevision = this.profile.maxRevision;
 
     this.socket = null;
     this.buffer = '';
@@ -169,6 +225,7 @@ class OpenProtocolNutrunner extends EventEmitter {
 
     this.commandSeq = 0;
     this._lastCommandId = null;
+    this._pendingVin    = null; // Stashed VIN awaiting MID 0050 ACK
   }
 
   /* =======================================================
@@ -232,6 +289,7 @@ class OpenProtocolNutrunner extends EventEmitter {
     this.state.connection.connected = false;
     this.state.connection.linkLayerReady = false;
     this.buffer = '';
+    this._pendingRevision = this.profile.maxRevision; // Reset for fresh negotiation on reconnect
 
     this.emit('disconnected');
 
@@ -335,20 +393,29 @@ class OpenProtocolNutrunner extends EventEmitter {
     
     if (expectAck) {
       const cmdId = ++this.commandSeq;
-      this.state.pendingCommands.set(cmdId, {
-        mid,
-        timestamp: Date.now(),
-        timeout: setTimeout(() => {
+
+      // Build Promise first so resolve/reject are in scope for the timeout closure
+      let resolve, reject;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+
+      const cmd = { mid, timestamp: Date.now(), resolve, reject, timeout: null };
+
+      cmd.timeout = setTimeout(() => {
+        if (this.state.pendingCommands.has(cmdId)) {
           this.state.pendingCommands.delete(cmdId);
+          reject(new CommandError(`MID ${mid} ACK timeout after ${COMMAND_TIMEOUT_MS} ms`, mid));
           this.emit('commandTimeout', { mid, cmdId });
-        }, COMMAND_TIMEOUT_MS)
-      });
-      
+        }
+      }, COMMAND_TIMEOUT_MS);
+
+      this.state.pendingCommands.set(cmdId, cmd);
       this._lastCommandId = cmdId;
+
+      this.socket.write(`${len}${body}\0`);
+      return promise; // resolves on MID 0005 ACK, rejects on MID 0004 NAK or timeout
     }
 
-    this.socket.write(`${len}${body}`);
-    return this._lastCommandId;
+    this.socket.write(`${len}${body}\0`);
   }
 
   _onData(data) {
@@ -490,19 +557,33 @@ class OpenProtocolNutrunner extends EventEmitter {
   _parse0061(p) {
     const rev = this.state.protocol.revision;
 
-    // --- REVISION 1 (Basic) ---
+    // --- REVISION 1 (Full Atlas Copco layout — same base offsets as Rev 4) ---
     if (rev === 1) {
-      const torqueStatus = p[22];
-      const angleStatus = p[23];
-      
       return {
-        tighteningId: p.slice(0, 10),
-        spindle: 1,
-        torque: Number(p.slice(10, 16)) / 100,
-        angle: Number(p.slice(16, 22)),
-        torqueStatus,
-        angleStatus,
-        ok: torqueStatus === '1' && angleStatus === '1'
+        cellId:         Number(p.slice(0, 4)),
+        channelId:      Number(p.slice(4, 6)),
+        controllerName: p.slice(6, 31).trim(),
+        vin:            p.slice(31, 56).trim(),
+        jobId:          Number(p.slice(56, 60)),
+        paramSetId:     Number(p.slice(60, 63)),
+        batchSize:      Number(p.slice(63, 67)),
+        batchCounter:   Number(p.slice(67, 71)),
+        ok:             p[71] === '1',
+        torqueStatus:   p[72],
+        angleStatus:    p[73],
+        torqueMin:      Number(p.slice(74, 80)) / 100,
+        torqueMax:      Number(p.slice(80, 86)) / 100,
+        torqueTarget:   Number(p.slice(86, 92)) / 100,
+        torque:         Number(p.slice(92, 98)) / 100,
+        angleMin:       Number(p.slice(98, 103)),
+        angleMax:       Number(p.slice(103, 108)),
+        angleTarget:    Number(p.slice(108, 113)),
+        angle:          Number(p.slice(113, 118)),
+        timestamp:      p.slice(118, 137),
+        lastPsetChange: p.slice(137, 156),
+        batchStatus:    p[156],
+        tighteningId:   p.slice(157, 167),
+        spindle:        1
       };
     }
     
@@ -625,7 +706,26 @@ class OpenProtocolNutrunner extends EventEmitter {
       case 4: // Command error
         this._resolvePendingCommand(d.failedMid, false, d);
         this.emit('commandError', d);
-        
+
+        // Auto-negotiate revision downgrade: if MID 0060 subscription is
+        // rejected by the controller, step down one revision and retry
+        // until Rev 1 is reached.
+        if (d.failedMid === 60 && this._pendingRevision > 1) {
+          const next = this._pendingRevision - 1;
+          this.emit('revisionDowngrade', { from: this._pendingRevision, to: next });
+          this.subscribeTighteningResults(next);
+          break;
+        }
+
+        // All revisions exhausted — controller rejects MID 0060 at every level
+        if (d.failedMid === 60 && this._pendingRevision === 1) {
+          this.emit('revisionNegotiationFailed', {
+            errorCode: d.errorCode,
+            message:   d.message
+          });
+          break;
+        }
+
         // Handle batch reset failure specifically
         if (this.state.batch.pendingReset) {
           this.state.batch.pendingReset = false;
@@ -636,7 +736,22 @@ class OpenProtocolNutrunner extends EventEmitter {
       case 5: // Command accepted
         this._resolvePendingCommand(d.acceptedMid, true);
         this.emit('commandAccepted', { mid: d.acceptedMid });
-        
+
+        // VIN download ACK — commit VIN to state so VIN_REQUIRED interlock clears.
+        // Many controllers never send MID 0051, so this is the only reliable place.
+        if (d.acceptedMid === 50 && this._pendingVin) {
+          this.state.product.vin      = this._pendingVin;
+          this.state.product.vinValid = true;
+          this.emit('vinDownloaded', { vin: this._pendingVin });
+          this._pendingVin = null;
+        }
+
+        // Lock in the negotiated revision once controller ACKs MID 0060
+        if (d.acceptedMid === 60) {
+          this.state.protocol.revision = this._pendingRevision;
+          this.emit('revisionNegotiated', { revision: this._pendingRevision });
+        }
+
         // Handle batch reset success
         if (this.state.batch.pendingReset && d.acceptedMid === 20) {
           this.state.batch.counter = 0;
@@ -751,11 +866,17 @@ class OpenProtocolNutrunner extends EventEmitter {
       if (cmd.mid === mid) {
         clearTimeout(cmd.timeout);
         this.state.pendingCommands.delete(cmdId);
-        this.emit(success ? 'commandSuccess' : 'commandFailed', { 
-          mid, 
-          cmdId, 
-          data 
-        });
+        if (success) {
+          cmd.resolve({ mid, cmdId });
+          this.emit('commandSuccess', { mid, cmdId, data });
+        } else {
+          const err = new CommandError(
+            data?.message || `MID ${mid} rejected by controller`, mid
+          );
+          err.errorCode = data?.errorCode ?? null;
+          cmd.reject(err);
+          this.emit('commandFailed', { mid, cmdId, data });
+        }
         break; // Only resolve first matching command
       }
     }
@@ -764,6 +885,7 @@ class OpenProtocolNutrunner extends EventEmitter {
   _clearPendingCommands() {
     for (const [cmdId, cmd] of this.state.pendingCommands.entries()) {
       clearTimeout(cmd.timeout);
+      cmd.reject(new CommandError(`MID ${cmd.mid} aborted — connection closed`, cmd.mid));
       this.emit('commandAborted', { mid: cmd.mid, cmdId });
     }
     this.state.pendingCommands.clear();
@@ -783,6 +905,14 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   _handleTighteningResult(d) {
+    // Sync VIN from result data — controllers echo it back in every MID 0061.
+    // This covers controllers that never send MID 0051 (VIN download reply)
+    // and keeps state current without relying on a separate MID 0050/0051 round-trip.
+    if (d.vin && d.vin.length > 0) {
+      this.state.product.vin      = d.vin;
+      this.state.product.vinValid = true;
+    }
+
     if (!this.state.product.vinLocked && this.state.product.vin) {
       this.state.product.vinLocked = true;
       this.emit('vinLocked', this.state.product.vin);
@@ -905,8 +1035,13 @@ class OpenProtocolNutrunner extends EventEmitter {
      Public API - Subscriptions
   ======================================================= */
 
-  subscribeTighteningResults() {
-    this.sendMID(60, '', true);
+  subscribeTighteningResults(revision = null) {
+    // Always start negotiation from profile.maxRevision (not from the comm-start
+    // ACK revision, which reflects the communication layer, not MID 0061 support).
+    // Downgrade retries pass an explicit revision value, bypassing this default.
+    const rev = revision !== null ? revision : this.profile.maxRevision;
+    this._pendingRevision = rev;
+    this.sendMID(60, String(rev).padStart(3, '0'), true).catch(() => {}); // rejection handled by case 4
     this.state.protocol.subscriptions.tighteningResults = true;
   }
 
@@ -916,7 +1051,7 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   subscribeAlarms() {
-    this.sendMID(70, '', true);
+    this.sendMID(70, '', true).catch(() => {}); // rejection handled by commandError event
     this.state.protocol.subscriptions.alarms = true;
   }
 
@@ -926,7 +1061,10 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   acknowledgeAlarm() {
-    this.sendMID(78, '', true);
+    // Fire-and-forget — do not expose Promise; route errors to commandError event.
+    this.sendMID(78, '', true).catch(err =>
+      this.emit('commandError', { mid: 78, message: err.message })
+    );
   }
 
   /* =======================================================
@@ -935,19 +1073,20 @@ class OpenProtocolNutrunner extends EventEmitter {
 
   startTightening() {
     this._check('startTightening');
-    return this.sendMID(43, '', true);
+    return this.sendMID(this.profile.toolEnableMid, '', true);
   }
 
   downloadVIN(vin) {
     if (vin.length > 25) {
       throw new Error('VIN exceeds 25 characters');
     }
+    this._pendingVin = vin; // Stash for MID 0005 ACK handler
     return this.sendMID(50, vin.padEnd(25), true);
   }
 
   selectJob(jobId) {
     const payload = jobId.toString().padStart(4, '0');
-    return this.sendMID(34, payload, true);
+    return this.sendMID(this.profile.jobSelectMid, payload, true);
   }
 
   selectParameterSet(paramSetId) {
@@ -956,11 +1095,11 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   enableTool() {
-    return this.sendMID(42, '', true);
+    return this.sendMID(this.profile.toolEnableMid, '', true);
   }
 
   disableTool() {
-    return this.sendMID(45, '', true);
+    return this.sendMID(this.profile.toolDisableMid, '', true);
   }
 
   resetBatch() {
@@ -992,7 +1131,12 @@ class OpenProtocolNutrunner extends EventEmitter {
   ======================================================= */
 
   getState() {
-    return JSON.parse(JSON.stringify(this.state));
+    // Custom replacer: Maps → arrays, timer handles → omitted.
+    return JSON.parse(JSON.stringify(this.state, (key, val) => {
+      if (val instanceof Map)    return [...val.values()];
+      if (val instanceof Object && val.constructor && val.constructor.name === 'Timeout') return undefined;
+      return val;
+    }));
   }
 
   isConnected() {
