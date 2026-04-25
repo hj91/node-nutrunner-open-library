@@ -1,6 +1,6 @@
 /**
- * Open Protocol Nutrunner Client v1.1.1 (node-nutrunner-open-library) 
- * * Production-grade Atlas Copco Open Protocol client for Node.js
+ * Open Protocol Nutrunner Client v1.1.2 (node-nutrunner-open-library) 
+ * * Production-grade Open Protocol client for Node.js — multi-brand support
  * Handles nutrunner communication, tightening cycles, VIN traceability,
  * batch manufacturing, and industrial safety interlocks.
  *
@@ -74,6 +74,15 @@ const FRAME_VALIDATION_ENABLED = true;
 ========================================================= */
 
 const BRAND_PROFILES = {
+  // Generic / spec-default: Open Protocol specification defaults.
+  // Use this when the manufacturer is unknown or the controller is spec-compliant.
+  // Atlas Copco authored the spec, so these MIDs match their implementation.
+  'generic': {
+    jobSelectMid:   38,  // MID 0038 = Select Job (spec default)
+    toolEnableMid:  43,  // MID 0043 = Enable Tool (spec default)
+    toolDisableMid: 42,  // MID 0042 = Disable Tool (spec default)
+    maxRevision:     4   // highest MID 0061 revision to request
+  },
   // Atlas Copco PowerFocus / PowerMACS
   'atlas-copco': {
     jobSelectMid:   38,  // MID 0038 = Select Job
@@ -286,10 +295,22 @@ class OpenProtocolNutrunner extends EventEmitter {
     this._clearWatchdog();
     this._clearPendingCommands();
     
-    this.state.connection.connected = false;
+    this.state.connection.connected    = false;
     this.state.connection.linkLayerReady = false;
     this.buffer = '';
     this._pendingRevision = this.profile.maxRevision; // Reset for fresh negotiation on reconnect
+
+    // Reset operational state so stale flags cannot bypass interlocks after reconnect.
+    // The user MUST re-run selectJob / enableTool inside the linkEstablished handler.
+    this.state.controller.ready        = false;
+    this.state.tool.enabled            = false;
+    this.state.tool.running            = false;
+    this.state.job.active              = false;
+    this.state.job.locked              = false;
+    this.state.product.vinValid        = false;
+    this.state.product.vinLocked       = false;
+    this.state.product.vinRequired     = false;
+    this._pendingVin                   = null; // discard any stashed VIN from previous session
 
     this.emit('disconnected');
 
