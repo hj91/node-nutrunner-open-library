@@ -1,6 +1,6 @@
 /**
- * Open Protocol Nutrunner Client v1.1.2 (node-nutrunner-open-library) 
- * * Production-grade Open Protocol client for Node.js — multi-brand support
+ * Open Protocol Nutrunner Client v1.2.0 (node-nutrunner-open-library) 
+ * Production-grade Open Protocol client for Node.js — multi-brand support
  * Handles nutrunner communication, tightening cycles, VIN traceability,
  * batch manufacturing, and industrial safety interlocks.
  *
@@ -10,12 +10,28 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * * http://www.apache.org/licenses/LICENSE-2.0
- * * Unless required by applicable law or agreed to in writing, software
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Changelog v1.2.0:
+ *   • MID 0041 parser corrected from 4-bit truncated to full 8-bit spec layout
+ *     — old: controllerReady(0) toolEnabled(1) toolRunning(2) alarmActive(3)
+ *     — new: controllerReady(0) toolReady(1) toolEnabled(2) toolRunning(3)
+ *            direction(4) processOn(5) alarmActive(6) emergencyStop(7)
+ *   • createInitialState() expanded: tool.ready, tool.direction, tool.processOn,
+ *     controller.emergencyStop
+ *   • _handleMID case 41: maps all 8 bits into state; emits directionChanged
+ *     and emergencyStop events on rising/falling edges
+ *   • _startTighteningCycle: direction now included in tighteningCycleStarted payload
+ *   • _check('startTightening'): emergencyStop interlock added
+ *   • isReady(): includes !controller.emergencyStop
+ *   • _onClose(): resets new state fields on disconnect
  */
 
 'use strict';
@@ -67,44 +83,33 @@ const FRAME_VALIDATION_ENABLED = true;
 
 /* =========================================================
    Brand Profiles
-   MID assignments vary by manufacturer. Specify `brand` in
-   the constructor to pick a profile, or override individual
-   MIDs via jobSelectMid / toolEnableMid / toolDisableMid /
-   maxRevision constructor options.
 ========================================================= */
 
 const BRAND_PROFILES = {
-  // Generic / spec-default: Open Protocol specification defaults.
-  // Use this when the manufacturer is unknown or the controller is spec-compliant.
-  // Atlas Copco authored the spec, so these MIDs match their implementation.
   'generic': {
-    jobSelectMid:   38,  // MID 0038 = Select Job (spec default)
-    toolEnableMid:  43,  // MID 0043 = Enable Tool (spec default)
-    toolDisableMid: 42,  // MID 0042 = Disable Tool (spec default)
-    maxRevision:     4   // highest MID 0061 revision to request
+    jobSelectMid:   38,
+    toolEnableMid:  43,
+    toolDisableMid: 42,
+    maxRevision:     4
   },
-  // Atlas Copco PowerFocus / PowerMACS
   'atlas-copco': {
-    jobSelectMid:   38,  // MID 0038 = Select Job
-    toolEnableMid:  43,  // MID 0043 = Enable Tool
-    toolDisableMid: 42,  // MID 0042 = Disable Tool
-    maxRevision:     4   // highest MID 0061 revision to request
+    jobSelectMid:   38,
+    toolEnableMid:  43,
+    toolDisableMid: 42,
+    maxRevision:     4
   },
-  // Stanley Assembly Technologies
   'stanley': {
     jobSelectMid:   34,
     toolEnableMid:  43,
     toolDisableMid: 42,
     maxRevision:     2
   },
-  // Desoutter Industrial Tools
   'desoutter': {
     jobSelectMid:   38,
     toolEnableMid:  43,
     toolDisableMid: 42,
     maxRevision:     4
   },
-  // Ingersoll Rand
   'ingersoll-rand': {
     jobSelectMid:   34,
     toolEnableMid:  43,
@@ -112,7 +117,6 @@ const BRAND_PROFILES = {
     maxRevision:     2
   }
 };
-
 
 /* =========================================================
    State Factory
@@ -141,14 +145,18 @@ function createInitialState() {
       ready: false,
       errorActive: false,
       errorCode: null,
-      alarms: []
+      alarms: [],
+      emergencyStop: false    // ← v1.2.0: from MID 0041 bit[7]
     },
 
     tool: {
-      enabled: false,
-      running: false,
+      ready: false,           // ← v1.2.0: from MID 0041 bit[1] (was missing)
+      enabled: false,         //            now correctly bit[2] (was bit[1])
+      running: false,         //            now correctly bit[3] (was bit[2])
+      direction: '—',        // ← v1.2.0: from MID 0041 bit[4]; 'FORWARD', 'REVERSE', or '—'
+      processOn: false,       // ← v1.2.0: from MID 0041 bit[5]
       spindleCount: 1,
-      spindleCountSource: 'default' // 'default', 'mid101', 'mid061', 'config', 'manual'
+      spindleCountSource: 'default'
     },
 
     product: {
@@ -196,14 +204,13 @@ class OpenProtocolNutrunner extends EventEmitter {
     port             = DEFAULT_PORT,
     autoReconnect    = true,
     validateFrames   = FRAME_VALIDATION_ENABLED,
-    spindleCount     = null,   // Override for controllers without MID 101
-    allowDuplicateCommands = false, // Set true to disable one-per-MID enforcement
-    brand            = 'generic',      // Controller brand — selects MID profile; 'generic' = spec-default
-    // Per-option overrides: take precedence over brand profile
+    spindleCount     = null,
+    allowDuplicateCommands = false,
+    brand            = 'generic',
     jobSelectMid     = null,
     toolEnableMid    = null,
     toolDisableMid   = null,
-    maxRevision      = null    // Highest MID 0061 revision to request
+    maxRevision      = null
   }) {
     super();
     this.host = host;
@@ -213,7 +220,6 @@ class OpenProtocolNutrunner extends EventEmitter {
     this.configuredSpindleCount = spindleCount;
     this.allowDuplicateCommands = allowDuplicateCommands;
 
-    // Resolve brand profile then apply any per-option overrides
     const baseProfile = BRAND_PROFILES[brand] || BRAND_PROFILES['generic'];
     this.profile = {
       jobSelectMid:   jobSelectMid   !== null ? jobSelectMid   : baseProfile.jobSelectMid,
@@ -234,7 +240,7 @@ class OpenProtocolNutrunner extends EventEmitter {
 
     this.commandSeq = 0;
     this._lastCommandId = null;
-    this._pendingVin    = null; // Stashed VIN awaiting MID 0050 ACK
+    this._pendingVin    = null;
   }
 
   /* =======================================================
@@ -255,7 +261,6 @@ class OpenProtocolNutrunner extends EventEmitter {
           this.state.connection.reconnectAttempts = 0;
           this.reconnectDelay = RECONNECT_INITIAL_DELAY_MS;
 
-          // Apply configured spindle count if provided
           if (this.configuredSpindleCount !== null) {
             this.state.tool.spindleCount = this.configuredSpindleCount;
             this.state.tool.spindleCountSource = 'config';
@@ -263,7 +268,7 @@ class OpenProtocolNutrunner extends EventEmitter {
 
           this.emit('connected');
           this._startHeartbeat();
-          this.sendMID(1); // Comm start
+          this.sendMID(1);
           resolve();
         }
       );
@@ -283,34 +288,38 @@ class OpenProtocolNutrunner extends EventEmitter {
     this.autoReconnect = false;
     this._stopReconnect();
     if (this.socket) {
-      this.sendMID(2); // Comm stop
+      this.sendMID(2);
       this.socket.destroy();
     }
   }
 
   _onClose() {
     const wasConnected = this.state.connection.connected;
-    
+
     this._stopHeartbeat();
     this._clearWatchdog();
     this._clearPendingCommands();
-    
-    this.state.connection.connected    = false;
+
+    this.state.connection.connected      = false;
     this.state.connection.linkLayerReady = false;
     this.buffer = '';
-    this._pendingRevision = this.profile.maxRevision; // Reset for fresh negotiation on reconnect
+    this._pendingRevision = this.profile.maxRevision;
 
-    // Reset operational state so stale flags cannot bypass interlocks after reconnect.
-    // The user MUST re-run selectJob / enableTool inside the linkEstablished handler.
-    this.state.controller.ready        = false;
-    this.state.tool.enabled            = false;
-    this.state.tool.running            = false;
-    this.state.job.active              = false;
-    this.state.job.locked              = false;
-    this.state.product.vinValid        = false;
-    this.state.product.vinLocked       = false;
-    this.state.product.vinRequired     = false;
-    this._pendingVin                   = null; // discard any stashed VIN from previous session
+    // Reset operational state — user must re-run selectJob/enableTool
+    // inside the linkEstablished handler after reconnect.
+    this.state.controller.ready         = false;
+    this.state.controller.emergencyStop = false;  // ← v1.2.0
+    this.state.tool.enabled             = false;
+    this.state.tool.running             = false;
+    this.state.tool.ready               = false;  // ← v1.2.0
+    this.state.tool.direction           = '—';   // ← v1.2.0
+    this.state.tool.processOn           = false;  // ← v1.2.0
+    this.state.job.active               = false;
+    this.state.job.locked               = false;
+    this.state.product.vinValid         = false;
+    this.state.product.vinLocked        = false;
+    this.state.product.vinRequired      = false;
+    this._pendingVin                    = null;
 
     this.emit('disconnected');
 
@@ -330,7 +339,7 @@ class OpenProtocolNutrunner extends EventEmitter {
     });
 
     this.reconnectTimer = setTimeout(() => {
-      this.connect().catch(err => {
+      this.connect().catch(() => {
         this.reconnectDelay = Math.min(
           this.reconnectDelay * RECONNECT_BACKOFF_FACTOR,
           RECONNECT_MAX_DELAY_MS
@@ -379,12 +388,11 @@ class OpenProtocolNutrunner extends EventEmitter {
 
   sendMID(mid, payload = '', expectAck = false) {
     this._touchTraffic();
-    
-    // Enforce one pending command per MID (industrial safety)
+
     if (expectAck && !this.allowDuplicateCommands) {
       const hasPending = [...this.state.pendingCommands.values()]
         .some(c => c.mid === mid);
-      
+
       if (hasPending) {
         throw new CommandError(
           `Command MID ${mid} already pending - wait for ACK or NAK`,
@@ -392,35 +400,24 @@ class OpenProtocolNutrunner extends EventEmitter {
         );
       }
     }
-    
-    const midStr = mid.toString().padStart(4, '0');
-    
-    // Standard Header Construction (12 chars after MID)
-    // Rev(3) NoAck(1) Station(2) Spindle(2) Spare(4)
-    const rev = '001';
-    // NoAck Flag: '0' = Ack Required (Default), '1' = No Ack
-    // If expectAck is TRUE, we send '0' (Please Ack).
-    // If expectAck is FALSE, we send '1' (Don't Ack).
-    // NOTE: This logic is inverted in the protocol spec (0=Ack, 1=NoAck)
-    const noAck = expectAck ? '0' : '1'; 
+
+    const midStr  = mid.toString().padStart(4, '0');
+    const rev     = '001';
+    const noAck   = expectAck ? '0' : '1';
     const station = '01';
     const spindle = '01';
-    const spare = '    ';
+    const spare   = '    ';
 
     const headerRest = `${rev}${noAck}${station}${spindle}${spare}`;
     const body = `${midStr}${headerRest}${payload}`;
-    
-    const len = (body.length + 4).toString().padStart(4, '0');
-    
+    const len  = (body.length + 4).toString().padStart(4, '0');
+
     if (expectAck) {
       const cmdId = ++this.commandSeq;
-
-      // Build Promise first so resolve/reject are in scope for the timeout closure
       let resolve, reject;
       const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
 
       const cmd = { mid, timestamp: Date.now(), resolve, reject, timeout: null };
-
       cmd.timeout = setTimeout(() => {
         if (this.state.pendingCommands.has(cmdId)) {
           this.state.pendingCommands.delete(cmdId);
@@ -433,7 +430,7 @@ class OpenProtocolNutrunner extends EventEmitter {
       this._lastCommandId = cmdId;
 
       this.socket.write(`${len}${body}\0`);
-      return promise; // resolves on MID 0005 ACK, rejects on MID 0004 NAK or timeout
+      return promise;
     }
 
     this.socket.write(`${len}${body}\0`);
@@ -441,39 +438,30 @@ class OpenProtocolNutrunner extends EventEmitter {
 
   _onData(data) {
     this._touchTraffic();
-    // Clean null terminators (common in simulators/TCP streams)
     this.buffer += data.toString().replace(/\0/g, '');
 
     while (this.buffer.length >= 4) {
       const lenStr = this.buffer.slice(0, 4);
-      
+
       if (this.validateFrames && !/^\d{4}$/.test(lenStr)) {
-        this.emit('frameError', { 
-          type: 'invalid_length', 
-          buffer: this.buffer.slice(0, 20) 
-        });
+        this.emit('frameError', { type: 'invalid_length', buffer: this.buffer.slice(0, 20) });
         this.buffer = this.buffer.slice(1);
         continue;
       }
 
       const len = parseInt(lenStr, 10);
-      
+
       if (this.validateFrames && (len < 20 || len > 9999)) {
-        this.emit('frameError', { 
-          type: 'length_out_of_range', 
-          length: len 
-        });
+        this.emit('frameError', { type: 'length_out_of_range', length: len });
         this.buffer = this.buffer.slice(1);
         continue;
       }
 
       if (this.buffer.length < len) return;
 
-      const frame = this.buffer.slice(4, len);
-      this.buffer = this.buffer.slice(len);
-
-      const mid = parseInt(frame.slice(0, 4), 10); // Standard offset: 0
-      // Standard Payload starts at index 16 (4 MID + 12 Header)
+      const frame   = this.buffer.slice(4, len);
+      this.buffer   = this.buffer.slice(len);
+      const mid     = parseInt(frame.slice(0, 4), 10);
       const payload = frame.slice(16);
 
       try {
@@ -492,82 +480,102 @@ class OpenProtocolNutrunner extends EventEmitter {
   _parseMID(mid, p) {
     switch (mid) {
 
-      case 2: // Comm start ACK (some controllers use MID 2 instead of 3)
-      case 3: // Comm start ACK
-        // Safely parse revision, handle padding/whitespace
-        const revStr = p.slice(0, 2).trim();
+      case 2:
+      case 3: {
+        const revStr   = p.slice(0, 2).trim();
         const revision = parseInt(revStr, 10);
-        return { 
-          revision: isNaN(revision) ? 1 : revision 
-        };
+        return { revision: isNaN(revision) ? 1 : revision };
+      }
 
-      case 4: // Command error
+      case 4:
         return {
           failedMid: Number(p.slice(0, 4)),
           errorCode: Number(p.slice(4, 8)),
-          message: p.slice(8).trim()
+          message:   p.slice(8).trim()
         };
 
-      case 5: // Command accepted
+      case 5:
         return { acceptedMid: Number(p.slice(0, 4)) };
 
-      case 11: // Parameter set ID reply
+      case 11:
         return { paramSetId: Number(p.slice(0, 3)) };
 
-      case 21: // Batch decrement ACK
+      case 21:
         return { batchCounter: Number(p.slice(0, 4)) };
 
-      case 41: // Tool status
+      case 41: {
+        // ── Full 8-bit parse — corrected from truncated 4-bit version ─────────
+        //
+        //  Bit  Old parser   Correct spec field
+        //  ---  ----------   ------------------
+        //  [0]  ✓            controllerReady
+        //  [1]  toolEnabled  toolReady       ← was misidentified
+        //  [2]  toolRunning  toolEnabled     ← was off by one
+        //  [3]  alarmActive  toolRunning     ← was off by one
+        //  [4]  (missing)    direction       ← 0=FORWARD, 1=REVERSE
+        //  [5]  (missing)    processOn
+        //  [6]  (missing)    alarmActive     ← was at wrong position
+        //  [7]  (missing)    emergencyStop
+        //
+        // Bounds-checked: controllers may send fewer than 8 bytes.
+        const bit = (i) => p.length > i && p[i] === '1';
+        const dir = p.length > 4 ? p[4] : null;
         return {
-          controllerReady: p[0] === '1',
-          toolEnabled: p[1] === '1',
-          toolRunning: p[2] === '1',
-          alarmActive: p[3] === '1'
+          controllerReady: bit(0),
+          toolReady:       bit(1),
+          toolEnabled:     bit(2),
+          toolRunning:     bit(3),
+          direction:       dir === '1' ? 'REVERSE' : dir === '0' ? 'FORWARD' : '—',
+          processOn:       bit(5),
+          alarmActive:     bit(6),
+          emergencyStop:   bit(7)
         };
+      }
 
-      case 51: // VIN download reply
+      case 51:
         return { vin: p.trim() };
 
-      case 52: // VIN required
+      case 52:
         return { vinRequired: true };
 
-      case 35: // Job ID reply
+      case 35:
         return { jobId: Number(p.slice(0, 4)) };
 
-      case 31: // Batch reply
+      case 31:
         return {
-          batchId: Number(p.slice(0, 4)),
-          batchSize: Number(p.slice(4, 8)),
+          batchId:      Number(p.slice(0, 4)),
+          batchSize:    Number(p.slice(4, 8)),
           batchCounter: Number(p.slice(8, 12))
         };
 
-      case 61: // Last tightening result
+      case 61:
         return this._parse0061(p);
 
-      case 65: // Old tightening result
+      case 65:
         return this._parse0065(p);
 
-      case 70: // Alarm
+      case 70:
+      case 71:
         return {
-          alarmCode: p.slice(0, 4),
+          alarmCode:       p.slice(0, 4),
           controllerReady: p[4] === '1',
-          toolReady: p[5] === '1',
-          timestamp: p.slice(6, 25),
-          message: p.slice(25).trim()
+          toolReady:       p[5] === '1',
+          timestamp:       p.slice(6, 25),
+          message:         p.slice(25).trim()
         };
 
-      case 76: // Alarm status
+      case 76:
         return {
-          alarmStatus: p[0] === '1',
+          alarmStatus:   p[0] === '1',
           currentAlarms: this._parseAlarmList(p.slice(1))
         };
 
-      case 101: // Multi-spindle cycle complete
+      case 101:
         return {
-          cycleId: p.slice(0, 10),
+          cycleId:      p.slice(0, 10),
           spindleCount: Number(p.slice(10, 12)),
-          overallOk: p[12] === '1',
-          timestamp: p.slice(13, 32)
+          overallOk:    p[12] === '1',
+          timestamp:    p.slice(13, 32)
         };
 
       default:
@@ -578,7 +586,6 @@ class OpenProtocolNutrunner extends EventEmitter {
   _parse0061(p) {
     const rev = this.state.protocol.revision;
 
-    // --- REVISION 1 (Full Atlas Copco layout — same base offsets as Rev 4) ---
     if (rev === 1) {
       return {
         cellId:         Number(p.slice(0, 4)),
@@ -592,10 +599,10 @@ class OpenProtocolNutrunner extends EventEmitter {
         ok:             p[71] === '1',
         torqueStatus:   p[72],
         angleStatus:    p[73],
-        torqueMin:      Number(p.slice(74, 80)) / 100,
-        torqueMax:      Number(p.slice(80, 86)) / 100,
-        torqueTarget:   Number(p.slice(86, 92)) / 100,
-        torque:         Number(p.slice(92, 98)) / 100,
+        torqueMin:      Number(p.slice(74, 80))  / 100,
+        torqueMax:      Number(p.slice(80, 86))  / 100,
+        torqueTarget:   Number(p.slice(86, 92))  / 100,
+        torque:         Number(p.slice(92, 98))  / 100,
         angleMin:       Number(p.slice(98, 103)),
         angleMax:       Number(p.slice(103, 108)),
         angleTarget:    Number(p.slice(108, 113)),
@@ -607,90 +614,71 @@ class OpenProtocolNutrunner extends EventEmitter {
         spindle:        1
       };
     }
-    
-    // --- REVISION 4 (Advanced - Per Official Spec R 2.16.0 Table 101) ---
+
     if (rev === 4) {
       return {
-        // Controller identification (0-30)
-        cellId: Number(p.slice(0, 4)),
-        channelId: Number(p.slice(4, 6)),
+        cellId:         Number(p.slice(0, 4)),
+        channelId:      Number(p.slice(4, 6)),
         controllerName: p.slice(6, 31).trim(),
-        
-        // Traceability (31-70)
-        vin: p.slice(31, 56).trim(),
-        jobId: Number(p.slice(56, 60)),
-        paramSetId: Number(p.slice(60, 63)),
-        batchSize: Number(p.slice(63, 67)),
-        batchCounter: Number(p.slice(67, 71)),
-        
-        // Status flags (71-73)
-        ok: p[71] === '1',
-        torqueStatus: p[72],
-        angleStatus: p[73],
-        
-        // Torque data (74-97) - Nm × 0.01
-        torqueMin: Number(p.slice(74, 80)) / 100,
-        torqueMax: Number(p.slice(80, 86)) / 100,
-        torqueTarget: Number(p.slice(86, 92)) / 100,
-        torque: Number(p.slice(92, 98)) / 100,
-        
-        // Angle data (98-117) - degrees
-        angleMin: Number(p.slice(98, 103)),
-        angleMax: Number(p.slice(103, 108)),
-        angleTarget: Number(p.slice(108, 113)),
-        angle: Number(p.slice(113, 118)),
-        
-        // Timestamps and unique ID (118-167)
-        timestamp: p.slice(118, 137),        // YYYY-MM-DD:HH:MM:SS
-        lastPsetChange: p.slice(137, 156),   // When pset was last modified
-        batchStatus: p[156],                 // Batch OK/NOK
-        tighteningId: p.slice(157, 167),     // 10-digit unique result ID
-        
-        // Rev 4 doesn't include spindle number in MID 61
-        spindle: 1
+        vin:            p.slice(31, 56).trim(),
+        jobId:          Number(p.slice(56, 60)),
+        paramSetId:     Number(p.slice(60, 63)),
+        batchSize:      Number(p.slice(63, 67)),
+        batchCounter:   Number(p.slice(67, 71)),
+        ok:             p[71] === '1',
+        torqueStatus:   p[72],
+        angleStatus:    p[73],
+        torqueMin:      Number(p.slice(74, 80))  / 100,
+        torqueMax:      Number(p.slice(80, 86))  / 100,
+        torqueTarget:   Number(p.slice(86, 92))  / 100,
+        torque:         Number(p.slice(92, 98))  / 100,
+        angleMin:       Number(p.slice(98, 103)),
+        angleMax:       Number(p.slice(103, 108)),
+        angleTarget:    Number(p.slice(108, 113)),
+        angle:          Number(p.slice(113, 118)),
+        timestamp:      p.slice(118, 137),
+        lastPsetChange: p.slice(137, 156),
+        batchStatus:    p[156],
+        tighteningId:   p.slice(157, 167),
+        spindle:        1
       };
     }
 
-    // --- REVISION 2 & 3 (Legacy Traceability) ---
-    // Default fallback for Rev 2 and 3
-    const spindleNum = Number(p.slice(10, 12)) || 1;
+    // Rev 2 & 3 fallback
     const torqueStatus = p.charAt(42) || '0';
-    const angleStatus = p.charAt(43) || '0';
-    const batchStatus = p.charAt(49) || '0';
-    
+    const angleStatus  = p.charAt(43) || '0';
+    const batchStatus  = p.charAt(49) || '0';
     return {
       tighteningId: p.slice(0, 10),
-      spindle: spindleNum,
-      torque: Number(p.slice(12, 18)) / 100,
-      angle: Number(p.slice(18, 24)),
-      torqueMin: Number(p.slice(24, 30)) / 100,
-      torqueMax: Number(p.slice(30, 36)) / 100,
-      torqueFinal: Number(p.slice(36, 42)) / 100,
+      spindle:      Number(p.slice(10, 12)) || 1,
+      torque:       Number(p.slice(12, 18)) / 100,
+      angle:        Number(p.slice(18, 24)),
+      torqueMin:    Number(p.slice(24, 30)) / 100,
+      torqueMax:    Number(p.slice(30, 36)) / 100,
+      torqueFinal:  Number(p.slice(36, 42)) / 100,
       torqueStatus,
       angleStatus,
-      timestamp: p.slice(44, 63),
-      ok: torqueStatus === '1' && angleStatus === '1',
+      timestamp:    p.slice(44, 63),
+      ok:           torqueStatus === '1' && angleStatus === '1',
       batchStatus,
-      vin: p.slice(63, 88).trim(),
-      jobId: Number(p.slice(88, 92)),
-      paramSetId: Number(p.slice(92, 95))
+      vin:          p.slice(63, 88).trim(),
+      jobId:        Number(p.slice(88, 92)),
+      paramSetId:   Number(p.slice(92, 95))
     };
   }
 
   _parse0065(p) {
-    // MID 65 has different layout than 61
     const torqueStatus = p.charAt(24) || '0';
-    const angleStatus = p.charAt(25) || '0';
-    
+    const angleStatus  = p.charAt(25) || '0';
     return {
       tighteningId: p.slice(0, 10),
-      spindle: Number(p.slice(10, 12)) || 1,
-      torque: Number(p.slice(12, 18)) / 100,
-      angle: Number(p.slice(18, 24)),
+      spindle:      Number(p.slice(10, 12)) || 1,
+      torque:       Number(p.slice(12, 18)) / 100,
+      angle:        Number(p.slice(18, 24)),
       torqueStatus,
       angleStatus,
-      ok: torqueStatus === '1' && angleStatus === '1',
-      timestamp: p.slice(26, 45)
+      ok:           torqueStatus === '1' && angleStatus === '1',
+      timestamp:    p.slice(26, 45)
     };
   }
 
@@ -712,25 +700,19 @@ class OpenProtocolNutrunner extends EventEmitter {
 
     switch (mid) {
 
-      case 2: // Some controllers send MID 2 as ACK
-      case 3: // Comm start ACK
-        this.state.protocol.revision = d.revision;
+      case 2:
+      case 3:
+        this.state.protocol.revision         = d.revision;
         this.state.connection.linkLayerReady = true;
         this.emit('linkEstablished', { revision: d.revision });
-        
-        // Auto-subscribe to tightening results
         this.subscribeTighteningResults();
-        // Auto-subscribe to alarms
         this.subscribeAlarms();
         break;
 
-      case 4: // Command error
+      case 4:
         this._resolvePendingCommand(d.failedMid, false, d);
         this.emit('commandError', d);
 
-        // Auto-negotiate revision downgrade: if MID 0060 subscription is
-        // rejected by the controller, step down one revision and retry
-        // until Rev 1 is reached.
         if (d.failedMid === 60 && this._pendingRevision > 1) {
           const next = this._pendingRevision - 1;
           this.emit('revisionDowngrade', { from: this._pendingRevision, to: next });
@@ -738,7 +720,6 @@ class OpenProtocolNutrunner extends EventEmitter {
           break;
         }
 
-        // All revisions exhausted — controller rejects MID 0060 at every level
         if (d.failedMid === 60 && this._pendingRevision === 1) {
           this.emit('revisionNegotiationFailed', {
             errorCode: d.errorCode,
@@ -747,19 +728,16 @@ class OpenProtocolNutrunner extends EventEmitter {
           break;
         }
 
-        // Handle batch reset failure specifically
         if (this.state.batch.pendingReset) {
           this.state.batch.pendingReset = false;
           this.emit('batchResetFailed', d);
         }
         break;
 
-      case 5: // Command accepted
+      case 5:
         this._resolvePendingCommand(d.acceptedMid, true);
         this.emit('commandAccepted', { mid: d.acceptedMid });
 
-        // VIN download ACK — commit VIN to state so VIN_REQUIRED interlock clears.
-        // Many controllers never send MID 0051, so this is the only reliable place.
         if (d.acceptedMid === 50 && this._pendingVin) {
           this.state.product.vin      = this._pendingVin;
           this.state.product.vinValid = true;
@@ -767,113 +745,123 @@ class OpenProtocolNutrunner extends EventEmitter {
           this._pendingVin = null;
         }
 
-        // Lock in the negotiated revision once controller ACKs MID 0060
         if (d.acceptedMid === 60) {
           this.state.protocol.revision = this._pendingRevision;
           this.emit('revisionNegotiated', { revision: this._pendingRevision });
         }
 
-        // Handle batch reset success
         if (this.state.batch.pendingReset && d.acceptedMid === 20) {
-          this.state.batch.counter = 0;
-          this.state.batch.complete = false;
+          this.state.batch.counter      = 0;
+          this.state.batch.complete     = false;
           this.state.batch.pendingReset = false;
           this.emit('batchResetConfirmed');
         }
         break;
 
-      case 11: // Parameter set ID
+      case 11:
         this.state.job.paramSetId = d.paramSetId;
         break;
 
-      case 21: // Batch decrement ACK
+      case 21:
         this.state.batch.counter = d.batchCounter;
         break;
 
-      case 41: // Tool status
-        this.state.controller.ready = d.controllerReady;
-        this.state.tool.enabled = d.toolEnabled;
-        this.state.tool.running = d.toolRunning;
-        this.state.controller.errorActive = d.alarmActive;
+      case 41: {
+        // ── Corrected MID 0041 state handler ─────────────────────────────────
+        const prevRunning   = this.state.tool.running;
+        const prevDirection = this.state.tool.direction;
+        const prevEmergency = this.state.controller.emergencyStop;
 
-        if (d.toolRunning && !this.state.tightening.inProgress) {
+        this.state.controller.ready         = d.controllerReady;
+        this.state.controller.errorActive   = d.alarmActive;
+        this.state.controller.emergencyStop = d.emergencyStop;  // ← v1.2.0
+        this.state.tool.ready               = d.toolReady;      // ← v1.2.0
+        this.state.tool.enabled             = d.toolEnabled;
+        this.state.tool.running             = d.toolRunning;
+        this.state.tool.direction           = d.direction;      // ← v1.2.0
+        this.state.tool.processOn           = d.processOn;      // ← v1.2.0
+
+        // Emit directionChanged on genuine edge; suppress '—' (unknown state)
+        if (d.direction !== prevDirection && d.direction !== '—') {
+          this.emit('directionChanged', { direction: d.direction });
+        }
+
+        // Emit emergencyStop on rising and falling edge
+        if (d.emergencyStop && !prevEmergency)
+          this.emit('emergencyStop', { active: true });
+        else if (!d.emergencyStop && prevEmergency)
+          this.emit('emergencyStop', { active: false });
+
+        // Start tightening cycle on toolRunning rising edge only
+        if (d.toolRunning && !prevRunning && !this.state.tightening.inProgress) {
           this._startTighteningCycle();
         }
         break;
+      }
 
-      case 51: // VIN reply
-        this.state.product.vin = d.vin;
+      case 51:
+        this.state.product.vin      = d.vin;
         this.state.product.vinValid = true;
         break;
 
-      case 52: // VIN required
+      case 52:
         this.state.product.vinRequired = true;
         this.emit('vinRequired');
         break;
 
-      case 35: // Job selected
-        this.state.job.jobId = d.jobId;
+      case 35:
+        this.state.job.jobId  = d.jobId;
         this.state.job.active = true;
         this.state.job.locked = true;
-        
-        // Clear VIN lock on job change (prevents stale lock across jobs)
         this.state.product.vinLocked = false;
-        
         this.emit('jobSelected', { jobId: d.jobId });
         break;
 
-      case 31: // Batch started
+      case 31:
         this.state.batch = {
-          batchId: d.batchId,
-          size: d.batchSize,
-          counter: d.batchCounter,
-          active: true,
-          complete: false,
-          locked: true,
+          batchId:      d.batchId,
+          size:         d.batchSize,
+          counter:      d.batchCounter,
+          active:       true,
+          complete:     false,
+          locked:       true,
           pendingReset: false
         };
-        
-        // Clear VIN lock on batch start (new traceability context)
         this.state.product.vinLocked = false;
-        
         this.emit('batchStarted', this.state.batch);
         break;
 
       case 61:
       case 65:
-        // Always ACK result, even if handler throws
         try {
           this._handleTighteningResult(d);
         } finally {
-          this.sendMID(62); // ACK must always be sent
+          this.sendMID(62);
         }
         break;
 
-      case 70: // Alarm
+      case 70:
+      case 71:
         this.state.controller.alarms.push(d);
         this.state.controller.errorActive = true;
         this.emit('alarm', d);
         break;
 
-      case 76: // Alarm status
+      case 76:
         if (!d.alarmStatus) {
-          this.state.controller.alarms = [];
+          this.state.controller.alarms      = [];
           this.state.controller.errorActive = false;
         }
         this.emit('alarmStatus', d);
         break;
 
-      case 101: // Multi-spindle cycle complete
-        // Update spindle count from controller if not manually configured
-        if (this.state.tool.spindleCountSource !== 'config' && 
+      case 101:
+        if (this.state.tool.spindleCountSource !== 'config' &&
             this.state.tool.spindleCountSource !== 'manual' &&
             d.spindleCount > 0) {
-          this.state.tool.spindleCount = d.spindleCount;
+          this.state.tool.spindleCount       = d.spindleCount;
           this.state.tool.spindleCountSource = 'mid101';
-          this.emit('spindleCountUpdated', { 
-            count: d.spindleCount, 
-            source: 'mid101' 
-          });
+          this.emit('spindleCountUpdated', { count: d.spindleCount, source: 'mid101' });
         }
         this.emit('multiSpindleCycleComplete', d);
         break;
@@ -898,7 +886,7 @@ class OpenProtocolNutrunner extends EventEmitter {
           cmd.reject(err);
           this.emit('commandFailed', { mid, cmdId, data });
         }
-        break; // Only resolve first matching command
+        break;
       }
     }
   }
@@ -917,18 +905,21 @@ class OpenProtocolNutrunner extends EventEmitter {
   ======================================================= */
 
   _startTighteningCycle() {
-    this.state.tightening.inProgress = true;
+    this.state.tightening.inProgress  = true;
     this.state.tightening.cycleStartTs = Date.now();
     this._startWatchdog();
     this.emit('tighteningCycleStarted', { 
-      timestamp: this.state.tightening.cycleStartTs 
+      timestamp: this.state.tightening.cycleStartTs,
+      direction: this.state.tool.direction    // ← v1.2.0: FORWARD / REVERSE / —
     });
   }
 
   _handleTighteningResult(d) {
-    // Sync VIN from result data — controllers echo it back in every MID 0061.
-    // This covers controllers that never send MID 0051 (VIN download reply)
-    // and keeps state current without relying on a separate MID 0050/0051 round-trip.
+    if (!this.state.tightening.inProgress || this.state.tightening.cycleStartTs === null) {
+      this.state.tightening.inProgress  = true;
+      this.state.tightening.cycleStartTs = Date.now();
+    }
+
     if (d.vin && d.vin.length > 0) {
       this.state.product.vin      = d.vin;
       this.state.product.vinValid = true;
@@ -939,46 +930,38 @@ class OpenProtocolNutrunner extends EventEmitter {
       this.emit('vinLocked', this.state.product.vin);
     }
 
-    // Auto-detect spindle count from results (for controllers without MID 101)
-    if (this.state.tool.spindleCountSource === 'default' && 
+    if (this.state.tool.spindleCountSource === 'default' &&
         d.spindle > this.state.tool.spindleCount) {
-      this.state.tool.spindleCount = d.spindle;
+      this.state.tool.spindleCount       = d.spindle;
       this.state.tool.spindleCountSource = 'mid061';
-      this.emit('spindleCountUpdated', { 
-        count: d.spindle, 
-        source: 'mid061' 
-      });
+      this.emit('spindleCountUpdated', { count: d.spindle, source: 'mid061' });
     }
 
     this.emit('spindleResult', d);
     this.state.tightening.pendingSpindles.set(d.spindle, d);
 
-    if (this.state.tightening.pendingSpindles.size <
-        this.state.tool.spindleCount) {
+    if (this.state.tightening.pendingSpindles.size < this.state.tool.spindleCount) {
       return;
     }
 
     this._clearWatchdog();
 
-    const results = [...this.state.tightening.pendingSpindles.values()];
+    const results   = [...this.state.tightening.pendingSpindles.values()];
     const overallOk = results.every(r => r.ok);
-    
+
     this.state.tightening.pendingSpindles.clear();
     this.state.tightening.inProgress = false;
 
-    // Handle batch progress
     if (this.state.batch.active && !this.state.batch.complete) {
       this.state.batch.counter++;
-      
       this.emit('batchProgress', {
-        counter: this.state.batch.counter,
-        size: this.state.batch.size,
+        counter:   this.state.batch.counter,
+        size:      this.state.batch.size,
         remaining: this.state.batch.size - this.state.batch.counter
       });
-
       if (this.state.batch.counter >= this.state.batch.size) {
         this.state.batch.complete = true;
-        this.state.batch.active = false;
+        this.state.batch.active   = false;
         this.emit('batchCompleted', this.state.batch);
       }
     }
@@ -994,16 +977,12 @@ class OpenProtocolNutrunner extends EventEmitter {
     this._clearWatchdog();
     this.state.tightening.watchdog = setTimeout(() => {
       const partialResults = [...this.state.tightening.pendingSpindles.values()];
-      
       this.state.tightening.inProgress = false;
       this.state.tightening.pendingSpindles.clear();
-      
-      // NOTE: tighteningIncomplete is emitted instead of tighteningCycleCompleted
-      // Upper layers MUST handle both completion paths
       this.emit('tighteningIncomplete', { 
         expected: this.state.tool.spindleCount,
         received: partialResults.length,
-        results: partialResults
+        results:  partialResults
       });
     }, TIGHTENING_TIMEOUT_MS);
   }
@@ -1025,7 +1004,6 @@ class OpenProtocolNutrunner extends EventEmitter {
     if (!s.connection.connected) {
       throw new InterlockError('NOT_CONNECTED', 'Controller not connected');
     }
-
     if (!s.connection.linkLayerReady) {
       throw new InterlockError('LINK_NOT_READY', 'Link layer not established');
     }
@@ -1043,6 +1021,9 @@ class OpenProtocolNutrunner extends EventEmitter {
       if (s.controller.errorActive) {
         throw new InterlockError('ALARM_ACTIVE', 'Controller alarm active');
       }
+      if (s.controller.emergencyStop) {                         // ← v1.2.0
+        throw new InterlockError('EMERGENCY_STOP', 'Emergency stop is active');
+      }
       if (s.product.vinRequired && !s.product.vinValid) {
         throw new InterlockError('VIN_REQUIRED', 'Valid VIN required');
       }
@@ -1057,12 +1038,9 @@ class OpenProtocolNutrunner extends EventEmitter {
   ======================================================= */
 
   subscribeTighteningResults(revision = null) {
-    // Always start negotiation from profile.maxRevision (not from the comm-start
-    // ACK revision, which reflects the communication layer, not MID 0061 support).
-    // Downgrade retries pass an explicit revision value, bypassing this default.
     const rev = revision !== null ? revision : this.profile.maxRevision;
     this._pendingRevision = rev;
-    this.sendMID(60, String(rev).padStart(3, '0'), true).catch(() => {}); // rejection handled by case 4
+    this.sendMID(60, String(rev).padStart(3, '0'), true).catch(() => {});
     this.state.protocol.subscriptions.tighteningResults = true;
   }
 
@@ -1072,7 +1050,7 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   subscribeAlarms() {
-    this.sendMID(70, '', true).catch(() => {}); // rejection handled by commandError event
+    this.sendMID(70, '', true).catch(() => {});
     this.state.protocol.subscriptions.alarms = true;
   }
 
@@ -1082,7 +1060,6 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   acknowledgeAlarm() {
-    // Fire-and-forget — do not expose Promise; route errors to commandError event.
     this.sendMID(78, '', true).catch(err =>
       this.emit('commandError', { mid: 78, message: err.message })
     );
@@ -1098,39 +1075,28 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   downloadVIN(vin) {
-    if (vin.length > 25) {
-      throw new Error('VIN exceeds 25 characters');
-    }
-    this._pendingVin = vin; // Stash for MID 0005 ACK handler
+    if (vin.length > 25) throw new Error('VIN exceeds 25 characters');
+    this._pendingVin = vin;
     return this.sendMID(50, vin.padEnd(25), true);
   }
 
   selectJob(jobId) {
-    const payload = jobId.toString().padStart(4, '0');
-    return this.sendMID(this.profile.jobSelectMid, payload, true);
+    return this.sendMID(this.profile.jobSelectMid, jobId.toString().padStart(4, '0'), true);
   }
 
   selectParameterSet(paramSetId) {
-    const payload = paramSetId.toString().padStart(3, '0');
-    return this.sendMID(18, payload, true);
+    return this.sendMID(18, paramSetId.toString().padStart(3, '0'), true);
   }
 
-  enableTool() {
-    return this.sendMID(this.profile.toolEnableMid, '', true);
-  }
-
-  disableTool() {
-    return this.sendMID(this.profile.toolDisableMid, '', true);
-  }
+  enableTool()  { return this.sendMID(this.profile.toolEnableMid,  '', true); }
+  disableTool() { return this.sendMID(this.profile.toolDisableMid, '', true); }
 
   resetBatch() {
-    // Mark as pending reset; only update state on MID 0005 ACK
     this.state.batch.pendingReset = true;
     return this.sendMID(20, '', true);
   }
 
   decrementBatch() {
-    // Manual batch decrement
     return this.sendMID(21, '', true);
   }
 
@@ -1139,10 +1105,8 @@ class OpenProtocolNutrunner extends EventEmitter {
   ======================================================= */
 
   setSpindleCount(count) {
-    if (count < 1 || count > 99) {
-      throw new Error('Spindle count must be between 1 and 99');
-    }
-    this.state.tool.spindleCount = count;
+    if (count < 1 || count > 99) throw new Error('Spindle count must be between 1 and 99');
+    this.state.tool.spindleCount       = count;
     this.state.tool.spindleCountSource = 'manual';
     this.emit('spindleCountUpdated', { count, source: 'manual' });
   }
@@ -1152,10 +1116,9 @@ class OpenProtocolNutrunner extends EventEmitter {
   ======================================================= */
 
   getState() {
-    // Custom replacer: Maps → arrays, timer handles → omitted.
     return JSON.parse(JSON.stringify(this.state, (key, val) => {
-      if (val instanceof Map)    return [...val.values()];
-      if (val instanceof Object && val.constructor && val.constructor.name === 'Timeout') return undefined;
+      if (val instanceof Map) return [...val.values()];
+      if (val instanceof Object && val.constructor?.name === 'Timeout') return undefined;
       return val;
     }));
   }
@@ -1165,15 +1128,16 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   isReady() {
-    return this.state.connection.connected && 
-           this.state.connection.linkLayerReady &&
-           this.state.controller.ready &&
-           !this.state.controller.errorActive;
+    return this.state.connection.connected
+        && this.state.connection.linkLayerReady
+        && this.state.controller.ready
+        && !this.state.controller.errorActive
+        && !this.state.controller.emergencyStop;  // ← v1.2.0
   }
 
   getSpindleCount() {
     return {
-      count: this.state.tool.spindleCount,
+      count:  this.state.tool.spindleCount,
       source: this.state.tool.spindleCountSource
     };
   }
