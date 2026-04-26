@@ -6,7 +6,7 @@
 const { OpenProtocolNutrunner } = require('node-nutrunner-open-library');
 
 const nutrunner = new OpenProtocolNutrunner({
-  host:        '127.0.0.1',
+  host:        '192.168.1.36',
   port:         4545,
   brand:       'atlas-copco',   // selects correct MID profile for this controller
   autoReconnect: true

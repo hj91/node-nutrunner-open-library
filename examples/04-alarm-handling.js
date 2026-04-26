@@ -6,8 +6,8 @@
 const { OpenProtocolNutrunner } = require('node-nutrunner-open-library');
 
 const nutrunner = new OpenProtocolNutrunner({
-  host:          '192.168.1.100',
-  brand:         'atlas-copco',
+  host:          '192.168.1.36',
+  brand:         'generic',
   autoReconnect: true
 });
 
@@ -30,7 +30,7 @@ nutrunner.on('alarmStatus', ({ alarmStatus, currentAlarms }) => {
 
 nutrunner.on('linkEstablished', async () => {
   try {
-    await nutrunner.selectJob(1);
+  //  await nutrunner.selectJob(1);
     await nutrunner.enableTool();
     console.log('Tool enabled — monitoring alarms...');
   } catch (err) {
