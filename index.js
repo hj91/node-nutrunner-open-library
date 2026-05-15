@@ -1,5 +1,5 @@
 /**
- * Open Protocol Nutrunner Client v1.2.0 (node-nutrunner-open-library) 
+ * Open Protocol Nutrunner Client v1.2.6 (node-nutrunner-open-library) 
  * Production-grade Open Protocol client for Node.js — multi-brand support
  * Handles nutrunner communication, tightening cycles, VIN traceability,
  * batch manufacturing, and industrial safety interlocks.
@@ -19,19 +19,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * Changelog v1.2.0:
- *   • MID 0041 parser corrected from 4-bit truncated to full 8-bit spec layout
- *     — old: controllerReady(0) toolEnabled(1) toolRunning(2) alarmActive(3)
- *     — new: controllerReady(0) toolReady(1) toolEnabled(2) toolRunning(3)
- *            direction(4) processOn(5) alarmActive(6) emergencyStop(7)
- *   • createInitialState() expanded: tool.ready, tool.direction, tool.processOn,
- *     controller.emergencyStop
- *   • _handleMID case 41: maps all 8 bits into state; emits directionChanged
- *     and emergencyStop events on rising/falling edges
- *   • _startTighteningCycle: direction now included in tighteningCycleStarted payload
- *   • _check('startTightening'): emergencyStop interlock added
- *   • isReady(): includes !controller.emergencyStop
- *   • _onClose(): resets new state fields on disconnect
+ * Changelog v1.2.6 (Simulator Support Edition):
+ * • Added 'simulator' profile locked to Revision 1 for instant link establishment.
+ * • Disabled MID 0070 (Alarm) subscriptions for the simulator profile to prevent handshake errors.
+ * • Added MID 0091 parser and state handler for multi-spindle status broadcasts.
+ * • Added setBatchSize (MID 0019) to force batch counter resets.
+ * • Added skipBolt (MID 0128) for explicit NOK bypass in strict batching.
+ * • Fixed simulator-specific data drift in MID 0061 caused by 2-byte Parameter IDs and 2-byte Job IDs.
+ * • Reverted invalid Angle scaling: Angle is mechanically transmitted as integers per OP Spec Rev 1.
  */
 
 'use strict';
@@ -115,6 +110,13 @@ const BRAND_PROFILES = {
     toolEnableMid:  43,
     toolDisableMid: 42,
     maxRevision:     2
+  },
+  'simulator': {
+    jobSelectMid:   38,
+    toolEnableMid:  43,
+    toolDisableMid: 42,
+    maxRevision:     1,
+    supportsAlarms:  false
   }
 };
 
@@ -137,7 +139,8 @@ function createInitialState() {
       subscriptions: {
         tighteningResults: false,
         alarms: false,
-        multiSpindleStatus: false
+        multiSpindleStatus: false,
+        multiSpindleResults: false
       }
     },
 
@@ -146,15 +149,15 @@ function createInitialState() {
       errorActive: false,
       errorCode: null,
       alarms: [],
-      emergencyStop: false    // ← v1.2.0: from MID 0041 bit[7]
+      emergencyStop: false
     },
 
     tool: {
-      ready: false,           // ← v1.2.0: from MID 0041 bit[1] (was missing)
-      enabled: false,         //            now correctly bit[2] (was bit[1])
-      running: false,         //            now correctly bit[3] (was bit[2])
-      direction: '—',        // ← v1.2.0: from MID 0041 bit[4]; 'FORWARD', 'REVERSE', or '—'
-      processOn: false,       // ← v1.2.0: from MID 0041 bit[5]
+      ready: false,           
+      enabled: false,         
+      running: false,         
+      direction: '—',        
+      processOn: false,       
       spindleCount: 1,
       spindleCountSource: 'default'
     },
@@ -222,10 +225,12 @@ class OpenProtocolNutrunner extends EventEmitter {
 
     const baseProfile = BRAND_PROFILES[brand] || BRAND_PROFILES['generic'];
     this.profile = {
+      isSimulator:    brand === 'simulator',
       jobSelectMid:   jobSelectMid   !== null ? jobSelectMid   : baseProfile.jobSelectMid,
       toolEnableMid:  toolEnableMid  !== null ? toolEnableMid  : baseProfile.toolEnableMid,
       toolDisableMid: toolDisableMid !== null ? toolDisableMid : baseProfile.toolDisableMid,
-      maxRevision:    maxRevision    !== null ? maxRevision    : baseProfile.maxRevision
+      maxRevision:    maxRevision    !== null ? maxRevision    : baseProfile.maxRevision,
+      supportsAlarms: baseProfile.supportsAlarms !== false
     };
     this._pendingRevision = this.profile.maxRevision;
 
@@ -305,15 +310,13 @@ class OpenProtocolNutrunner extends EventEmitter {
     this.buffer = '';
     this._pendingRevision = this.profile.maxRevision;
 
-    // Reset operational state — user must re-run selectJob/enableTool
-    // inside the linkEstablished handler after reconnect.
     this.state.controller.ready         = false;
-    this.state.controller.emergencyStop = false;  // ← v1.2.0
+    this.state.controller.emergencyStop = false; 
     this.state.tool.enabled             = false;
     this.state.tool.running             = false;
-    this.state.tool.ready               = false;  // ← v1.2.0
-    this.state.tool.direction           = '—';   // ← v1.2.0
-    this.state.tool.processOn           = false;  // ← v1.2.0
+    this.state.tool.ready               = false; 
+    this.state.tool.direction           = '—';   
+    this.state.tool.processOn           = false; 
     this.state.job.active               = false;
     this.state.job.locked               = false;
     this.state.product.vinValid         = false;
@@ -504,20 +507,6 @@ class OpenProtocolNutrunner extends EventEmitter {
         return { batchCounter: Number(p.slice(0, 4)) };
 
       case 41: {
-        // ── Full 8-bit parse — corrected from truncated 4-bit version ─────────
-        //
-        //  Bit  Old parser   Correct spec field
-        //  ---  ----------   ------------------
-        //  [0]  ✓            controllerReady
-        //  [1]  toolEnabled  toolReady       ← was misidentified
-        //  [2]  toolRunning  toolEnabled     ← was off by one
-        //  [3]  alarmActive  toolRunning     ← was off by one
-        //  [4]  (missing)    direction       ← 0=FORWARD, 1=REVERSE
-        //  [5]  (missing)    processOn
-        //  [6]  (missing)    alarmActive     ← was at wrong position
-        //  [7]  (missing)    emergencyStop
-        //
-        // Bounds-checked: controllers may send fewer than 8 bytes.
         const bit = (i) => p.length > i && p[i] === '1';
         const dir = p.length > 4 ? p[4] : null;
         return {
@@ -570,6 +559,13 @@ class OpenProtocolNutrunner extends EventEmitter {
           currentAlarms: this._parseAlarmList(p.slice(1))
         };
 
+      case 91:
+        return {
+          syncTighteningId: p.slice(0, 5),
+          spindleCount: Number(p.slice(5, 7)),
+          syncStatus: p.slice(7, 9)
+        };
+
       case 101:
         return {
           cycleId:      p.slice(0, 10),
@@ -586,36 +582,40 @@ class OpenProtocolNutrunner extends EventEmitter {
   _parse0061(p) {
     const rev = this.state.protocol.revision;
 
-    if (rev === 1) {
+    if (this.profile.isSimulator) {
       return {
-        cellId:         Number(p.slice(0, 4)),
-        channelId:      Number(p.slice(4, 6)),
-        controllerName: p.slice(6, 31).trim(),
-        vin:            p.slice(31, 56).trim(),
-        jobId:          Number(p.slice(56, 60)),
-        paramSetId:     Number(p.slice(60, 63)),
-        batchSize:      Number(p.slice(63, 67)),
-        batchCounter:   Number(p.slice(67, 71)),
-        ok:             p[71] === '1',
-        torqueStatus:   p[72],
-        angleStatus:    p[73],
-        torqueMin:      Number(p.slice(74, 80))  / 100,
-        torqueMax:      Number(p.slice(80, 86))  / 100,
-        torqueTarget:   Number(p.slice(86, 92))  / 100,
-        torque:         Number(p.slice(92, 98))  / 100,
-        angleMin:       Number(p.slice(98, 103)),
-        angleMax:       Number(p.slice(103, 108)),
-        angleTarget:    Number(p.slice(108, 113)),
-        angle:          Number(p.slice(113, 118)),
-        timestamp:      p.slice(118, 137),
-        lastPsetChange: p.slice(137, 156),
-        batchStatus:    p[156],
-        tighteningId:   p.slice(157, 167),
+        cellId:         Number(p.slice(2, 6)),
+        channelId:      Number(p.slice(8, 10)),
+        controllerName: p.slice(12, 37).trim(),
+        vin:            p.slice(39, 64).trim(),
+        jobId:          Number(p.slice(66, 68)),
+        paramSetId:     Number(p.slice(70, 73)),
+        batchSize:      Number(p.slice(75, 79)),
+        batchCounter:   Number(p.slice(81, 85)),
+        ok:             p[87] === '1',
+        torqueStatus:   p[90],
+        angleStatus:    p[93],
+        // Torque has implicit decimals in OP (divide by 100)
+        torqueMin:      Number(p.slice(96, 102))  / 100,
+        torqueMax:      Number(p.slice(104, 110)) / 100,
+        torqueTarget:   Number(p.slice(112, 118)) / 100,
+        torque:         Number(p.slice(120, 126)) / 100,
+        // Angles are strict whole numbers (integers) in OP Rev 1.
+        // The simulator mechanically truncates decimals before sending over TCP.
+        angleMin:       Number(p.slice(128, 133)),
+        angleMax:       Number(p.slice(135, 140)),
+        angleTarget:    Number(p.slice(142, 147)),
+        angle:          Number(p.slice(149, 154)),
+        timestamp:      p.slice(156, 175),
+        lastPsetChange: p.slice(177, 196),
+        batchStatus:    p[198],
+        tighteningId:   p.slice(201, 211),
         spindle:        1
       };
     }
 
-    if (rev === 4) {
+    // Standard Open Protocol strict positional layout (Rev 1 & 4)
+    if (rev === 1 || rev === 4) {
       return {
         cellId:         Number(p.slice(0, 4)),
         channelId:      Number(p.slice(4, 6)),
@@ -635,7 +635,7 @@ class OpenProtocolNutrunner extends EventEmitter {
         angleMin:       Number(p.slice(98, 103)),
         angleMax:       Number(p.slice(103, 108)),
         angleTarget:    Number(p.slice(108, 113)),
-        angle:          Number(p.slice(113, 118)),
+        angle:          Number(p.slice(113, 118)), 
         timestamp:      p.slice(118, 137),
         lastPsetChange: p.slice(137, 156),
         batchStatus:    p[156],
@@ -705,8 +705,12 @@ class OpenProtocolNutrunner extends EventEmitter {
         this.state.protocol.revision         = d.revision;
         this.state.connection.linkLayerReady = true;
         this.emit('linkEstablished', { revision: d.revision });
+        
         this.subscribeTighteningResults();
-        this.subscribeAlarms();
+        
+        if (this.profile.supportsAlarms) {
+          this.subscribeAlarms();
+        }
         break;
 
       case 4:
@@ -767,32 +771,28 @@ class OpenProtocolNutrunner extends EventEmitter {
         break;
 
       case 41: {
-        // ── Corrected MID 0041 state handler ─────────────────────────────────
         const prevRunning   = this.state.tool.running;
         const prevDirection = this.state.tool.direction;
         const prevEmergency = this.state.controller.emergencyStop;
 
         this.state.controller.ready         = d.controllerReady;
         this.state.controller.errorActive   = d.alarmActive;
-        this.state.controller.emergencyStop = d.emergencyStop;  // ← v1.2.0
-        this.state.tool.ready               = d.toolReady;      // ← v1.2.0
+        this.state.controller.emergencyStop = d.emergencyStop;
+        this.state.tool.ready               = d.toolReady; 
         this.state.tool.enabled             = d.toolEnabled;
         this.state.tool.running             = d.toolRunning;
-        this.state.tool.direction           = d.direction;      // ← v1.2.0
-        this.state.tool.processOn           = d.processOn;      // ← v1.2.0
+        this.state.tool.direction           = d.direction; 
+        this.state.tool.processOn           = d.processOn; 
 
-        // Emit directionChanged on genuine edge; suppress '—' (unknown state)
         if (d.direction !== prevDirection && d.direction !== '—') {
           this.emit('directionChanged', { direction: d.direction });
         }
 
-        // Emit emergencyStop on rising and falling edge
         if (d.emergencyStop && !prevEmergency)
           this.emit('emergencyStop', { active: true });
         else if (!d.emergencyStop && prevEmergency)
           this.emit('emergencyStop', { active: false });
 
-        // Start tightening cycle on toolRunning rising edge only
         if (d.toolRunning && !prevRunning && !this.state.tightening.inProgress) {
           this._startTighteningCycle();
         }
@@ -855,6 +855,14 @@ class OpenProtocolNutrunner extends EventEmitter {
         this.emit('alarmStatus', d);
         break;
 
+      case 91:
+        if (d.spindleCount > 0 && this.state.tool.spindleCountSource !== 'config') {
+          this.state.tool.spindleCount = d.spindleCount;
+          this.state.tool.spindleCountSource = 'mid091';
+        }
+        this.emit('multiSpindleStatus', d);
+        break;
+
       case 101:
         if (this.state.tool.spindleCountSource !== 'config' &&
             this.state.tool.spindleCountSource !== 'manual' &&
@@ -910,7 +918,7 @@ class OpenProtocolNutrunner extends EventEmitter {
     this._startWatchdog();
     this.emit('tighteningCycleStarted', { 
       timestamp: this.state.tightening.cycleStartTs,
-      direction: this.state.tool.direction    // ← v1.2.0: FORWARD / REVERSE / —
+      direction: this.state.tool.direction
     });
   }
 
@@ -1021,7 +1029,7 @@ class OpenProtocolNutrunner extends EventEmitter {
       if (s.controller.errorActive) {
         throw new InterlockError('ALARM_ACTIVE', 'Controller alarm active');
       }
-      if (s.controller.emergencyStop) {                         // ← v1.2.0
+      if (s.controller.emergencyStop) {                         
         throw new InterlockError('EMERGENCY_STOP', 'Emergency stop is active');
       }
       if (s.product.vinRequired && !s.product.vinValid) {
@@ -1101,6 +1109,46 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   /* =======================================================
+     Public API - Batch & Simulator Controls
+  ======================================================= */
+
+  // MID 0019: Set Batch Size (Simulator uses this to reset batches)
+  setBatchSize(paramSetId, size) {
+    const psetStr = paramSetId.toString().padStart(3, '0');
+    const sizeStr = size.toString().padStart(4, '0');
+    return this.sendMID(19, `${psetStr}${sizeStr}`, true);
+  }
+
+  // MID 0128: Job Batch Increment (Used in simulator to skip a NOK bolt)
+  skipBolt() {
+    return this.sendMID(128, '', true);
+  }
+
+  /* =======================================================
+     Public API - Multi-Spindle Subscriptions
+  ======================================================= */
+
+  subscribeMultiSpindleStatus() {
+    this.sendMID(90, '', true).catch(() => {});
+    this.state.protocol.subscriptions.multiSpindleStatus = true;
+  }
+
+  unsubscribeMultiSpindleStatus() {
+    this.sendMID(93);
+    this.state.protocol.subscriptions.multiSpindleStatus = false;
+  }
+
+  subscribeMultiSpindleResults() {
+    this.sendMID(100, '', true).catch(() => {});
+    this.state.protocol.subscriptions.multiSpindleResults = true;
+  }
+
+  unsubscribeMultiSpindleResults() {
+    this.sendMID(103);
+    this.state.protocol.subscriptions.multiSpindleResults = false;
+  }
+
+  /* =======================================================
      Public API - Configuration
   ======================================================= */
 
@@ -1132,7 +1180,7 @@ class OpenProtocolNutrunner extends EventEmitter {
         && this.state.connection.linkLayerReady
         && this.state.controller.ready
         && !this.state.controller.errorActive
-        && !this.state.controller.emergencyStop;  // ← v1.2.0
+        && !this.state.controller.emergencyStop;
   }
 
   getSpindleCount() {
