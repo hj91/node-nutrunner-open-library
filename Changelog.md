@@ -2,6 +2,27 @@
 
 ---
 
+## [1.2.6] - Simulator Support & Multi-Spindle Updates - 2026-05-15
+
+### Added
+- **`simulator` Brand Profile:** A dedicated connection profile locked to Open Protocol Revision 1 to bypass revision negotiation loops and ensure instant link establishment with the Rust-based `open-protocol-device-simulator`.
+- **Strict Batch Management Commands:**
+  - `setBatchSize(paramSetId, size)` (MID 0019): Used to force a batch counter reset on the controller.
+  - `skipBolt()` (MID 0128): Explicitly increments the job batch counter without an `OK` tightening result. Essential for handling NOK bypass/max-retry workflows in strict batching scenarios.
+- **Multi-Spindle APIs:**
+  - Added parser and state handler for MID 0091 (Multi-Spindle Status Broadcast).
+  - Added full suite of subscription commands: `subscribeMultiSpindleStatus()`, `unsubscribeMultiSpindleStatus()`, `subscribeMultiSpindleResults()`, and `unsubscribeMultiSpindleResults()` (MIDs 0090, 0093, 0100, 0103).
+
+### Fixed
+- **MID 0061 Simulator Data Drift:** The simulator deviates from the standard Rev 1 spec by prepending 2-byte Parameter IDs to every field and shortening the Job ID string to 2 bytes. Added a dedicated `isSimulator` extraction block to perfectly align the byte-offsets and accurately parse torque, angle, and result flags without offset drift.
+- **Angle Scaling:** Fixed a bug where angle values were erroneously divided by 100. Angle is now strictly parsed as a whole integer degree, adhering to the Open Protocol Rev 1 specification constraints. 
+
+### Changed
+- **Alarm Subscription Handshake:** Disabled automatic MID 0070 (Alarm) subscriptions during link establishment for the `simulator` profile (via a new `supportsAlarms` internal flag). This prevents the simulator from throwing MID 0004 rejection errors during the initial connection handshake.
+
+---
+
+
 ## [1.2.0] - MID 0041 Full 8-Bit Parser & Direction Tracking - 2026-04-25
 
 ### Fixed
