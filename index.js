@@ -1,5 +1,5 @@
 /**
- * Open Protocol Nutrunner Client v1.2.6 (node-nutrunner-open-library) 
+ * Open Protocol Nutrunner Client v1.2.7 (node-nutrunner-open-library)
  * Production-grade Open Protocol client for Node.js — multi-brand support
  * Handles nutrunner communication, tightening cycles, VIN traceability,
  * batch manufacturing, and industrial safety interlocks.
@@ -19,14 +19,36 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Changelog v1.2.7 (Real Hardware Multi-Spindle Fix):
+ * • BUGFIX: sendMID spare field corrected to 8 spaces (was 4) — TX frames now
+ *   correctly emit 20-byte header bodies per Open Protocol spec. This resolves
+ *   the "Message too short: expected at least 20 bytes, got 18" parse errors.
+ * • BUGFIX: Frame validation threshold corrected from len<20 to len<24.
+ *   The `len` field is the TOTAL frame size (including the 4-byte length prefix),
+ *   so minimum valid frame = 24, not 20.
+ * • BUGFIX: MID 0065 now ACKs with MID 0066 (not MID 0062). Sending MID 0062
+ *   in response to MID 0065 was a protocol violation against real controllers.
+ * • BUGFIX: pendingSpindles map now cleared at the START of each new tightening
+ *   cycle to prevent stale results from a timed-out cycle mixing with new data.
+ * • BUGFIX: Multi-spindle Rev 1 — pendingSpindles now keyed by tighteningId
+ *   (not spindle number) because Rev 1 does not carry an explicit spindle field.
+ *   Real hardware spindle numbers require Rev 2+ subscription.
+ * • BUGFIX: MID 0062 now sent only ONCE per tightening cycle (after all spindles
+ *   accumulate), not once per individual spindle result. Fixes ACK flooding on
+ *   Atlas Copco Power Focus and other strict multi-spindle controllers.
+ * • CLARIFIED: batch.counter semantics = number of COMPLETED CYCLES (one cycle
+ *   = all spindles tightened once). This matches how the controller's own batch
+ *   counter operates when using MID 0031 batch management.
+ *
  * Changelog v1.2.6 (Simulator Support Edition):
  * • Added 'simulator' profile locked to Revision 1 for instant link establishment.
- * • Disabled MID 0070 (Alarm) subscriptions for the simulator profile to prevent handshake errors.
+ * • Disabled MID 0070 (Alarm) subscriptions for the simulator profile.
  * • Added MID 0091 parser and state handler for multi-spindle status broadcasts.
  * • Added setBatchSize (MID 0019) to force batch counter resets.
  * • Added skipBolt (MID 0128) for explicit NOK bypass in strict batching.
- * • Fixed simulator-specific data drift in MID 0061 caused by 2-byte Parameter IDs and 2-byte Job IDs.
- * • Reverted invalid Angle scaling: Angle is mechanically transmitted as integers per OP Spec Rev 1.
+ * • Fixed simulator-specific data drift in MID 0061 caused by 2-byte Parameter
+ *   IDs and 2-byte Job IDs.
+ * • Reverted invalid Angle scaling: Angle is integers per OP Spec Rev 1.
  */
 
 'use strict';
@@ -36,7 +58,7 @@ const EventEmitter = require('events');
 
 /* =========================================================
    Errors
-========================================================= */
+   ========================================================= */
 
 class InterlockError extends Error {
   constructor(code, message) {
@@ -65,132 +87,155 @@ class CommandError extends Error {
 
 /* =========================================================
    Defaults
-========================================================= */
+   ========================================================= */
 
-const DEFAULT_PORT = 4545;
-const HEARTBEAT_INTERVAL_MS = 7000;
-const TIGHTENING_TIMEOUT_MS = 8000;
+const DEFAULT_PORT               = 4545;
+const HEARTBEAT_INTERVAL_MS      = 7000;
+const TIGHTENING_TIMEOUT_MS      = 8000;
 const RECONNECT_INITIAL_DELAY_MS = 1000;
-const RECONNECT_MAX_DELAY_MS = 30000;
-const RECONNECT_BACKOFF_FACTOR = 2;
-const COMMAND_TIMEOUT_MS = 5000;
-const FRAME_VALIDATION_ENABLED = true;
+const RECONNECT_MAX_DELAY_MS     = 30000;
+const RECONNECT_BACKOFF_FACTOR   = 2;
+const COMMAND_TIMEOUT_MS         = 5000;
+const FRAME_VALIDATION_ENABLED   = true;
+
+// Open Protocol minimum frame size:
+// 4 bytes (length field) + 20 bytes (minimum header body) = 24 total.
+const MIN_FRAME_SIZE = 24;
 
 /* =========================================================
    Brand Profiles
-========================================================= */
+   ========================================================= */
 
 const BRAND_PROFILES = {
   'generic': {
     jobSelectMid:   38,
     toolEnableMid:  43,
     toolDisableMid: 42,
-    maxRevision:     4
+    maxRevision:     4,
+    supportsAlarms:  true,
+    isSimulator:     false
   },
   'atlas-copco': {
     jobSelectMid:   38,
     toolEnableMid:  43,
     toolDisableMid: 42,
-    maxRevision:     4
+    maxRevision:     4,
+    supportsAlarms:  true,
+    isSimulator:     false
   },
   'stanley': {
     jobSelectMid:   34,
     toolEnableMid:  43,
     toolDisableMid: 42,
-    maxRevision:     2
+    maxRevision:     2,
+    supportsAlarms:  true,
+    isSimulator:     false
   },
   'desoutter': {
     jobSelectMid:   38,
     toolEnableMid:  43,
     toolDisableMid: 42,
-    maxRevision:     4
+    maxRevision:     4,
+    supportsAlarms:  true,
+    isSimulator:     false
   },
   'ingersoll-rand': {
     jobSelectMid:   34,
     toolEnableMid:  43,
     toolDisableMid: 42,
-    maxRevision:     2
+    maxRevision:     2,
+    supportsAlarms:  true,
+    isSimulator:     false
   },
   'simulator': {
+    // Locked to Rev 1 for instant link establishment without revision negotiation.
+    // Alarm subscription (MID 0070) disabled — simulator does not support it.
     jobSelectMid:   38,
     toolEnableMid:  43,
     toolDisableMid: 42,
     maxRevision:     1,
-    supportsAlarms:  false
+    supportsAlarms:  false,
+    isSimulator:     true
   }
 };
 
 /* =========================================================
    State Factory
-========================================================= */
+   ========================================================= */
 
 function createInitialState() {
   return {
     connection: {
-      connected: false,
-      linkLayerReady: false,
-      lastMID: null,
-      reconnecting: false,
+      connected:         false,
+      linkLayerReady:    false,
+      lastMID:           null,
+      reconnecting:      false,
       reconnectAttempts: 0
     },
 
     protocol: {
       revision: 1,
       subscriptions: {
-        tighteningResults: false,
-        alarms: false,
-        multiSpindleStatus: false,
+        tighteningResults:   false,
+        alarms:              false,
+        multiSpindleStatus:  false,
         multiSpindleResults: false
       }
     },
 
     controller: {
-      ready: false,
-      errorActive: false,
-      errorCode: null,
-      alarms: [],
+      ready:         false,
+      errorActive:   false,
+      errorCode:     null,
+      alarms:        [],
       emergencyStop: false
     },
 
     tool: {
-      ready: false,           
-      enabled: false,         
-      running: false,         
-      direction: '—',        
-      processOn: false,       
-      spindleCount: 1,
+      ready:              false,
+      enabled:            false,
+      running:            false,
+      direction:          '—',
+      processOn:          false,
+      spindleCount:       1,
       spindleCountSource: 'default'
     },
 
     product: {
-      vin: null,
+      vin:         null,
       vinRequired: false,
-      vinValid: false,
-      vinLocked: false
+      vinValid:    false,
+      vinLocked:   false
     },
 
     job: {
-      jobId: null,
+      jobId:      null,
       paramSetId: null,
-      active: false,
-      locked: false
+      active:     false,
+      locked:     false
     },
 
     batch: {
-      batchId: null,
-      size: null,
-      counter: 0,
-      active: false,
-      complete: false,
-      locked: false,
+      batchId:      null,
+      size:         null,
+      counter:      0,
+      active:       false,
+      complete:     false,
+      locked:       false,
       pendingReset: false
     },
 
     tightening: {
-      inProgress: false,
-      cycleStartTs: null,
+      inProgress:      false,
+      cycleStartTs:    null,
+      // KEY: tighteningId (string) → result object.
+      // Rev 1 & Rev 4 do not carry an explicit spindle number field.
+      // Using tighteningId as the key is the only reliable way to de-duplicate
+      // results from multi-spindle heads at Rev 1.
+      // At Rev 2+, results carry an explicit spindle number; the key remains
+      // tighteningId for consistency and to avoid duplicate-spindle collisions.
       pendingSpindles: new Map(),
-      watchdog: null
+      watchdog:        null
     },
 
     pendingCommands: new Map()
@@ -199,92 +244,83 @@ function createInitialState() {
 
 /* =========================================================
    Client
-========================================================= */
+   ========================================================= */
 
 class OpenProtocolNutrunner extends EventEmitter {
-  constructor({ 
-    host, 
-    port             = DEFAULT_PORT,
-    autoReconnect    = true,
-    validateFrames   = FRAME_VALIDATION_ENABLED,
-    spindleCount     = null,
+  constructor({
+    host,
+    port                   = DEFAULT_PORT,
+    autoReconnect          = true,
+    validateFrames         = FRAME_VALIDATION_ENABLED,
+    spindleCount           = null,
     allowDuplicateCommands = false,
-    brand            = 'generic',
-    jobSelectMid     = null,
-    toolEnableMid    = null,
-    toolDisableMid   = null,
-    maxRevision      = null
+    brand                  = 'generic',
+    jobSelectMid           = null,
+    toolEnableMid          = null,
+    toolDisableMid         = null,
+    maxRevision            = null
   }) {
     super();
-    this.host = host;
-    this.port = port;
-    this.autoReconnect = autoReconnect;
-    this.validateFrames = validateFrames;
+    this.host                   = host;
+    this.port                   = port;
+    this.autoReconnect          = autoReconnect;
+    this.validateFrames         = validateFrames;
     this.configuredSpindleCount = spindleCount;
     this.allowDuplicateCommands = allowDuplicateCommands;
 
     const baseProfile = BRAND_PROFILES[brand] || BRAND_PROFILES['generic'];
     this.profile = {
-      isSimulator:    brand === 'simulator',
+      isSimulator:    baseProfile.isSimulator,
+      supportsAlarms: baseProfile.supportsAlarms !== false,
       jobSelectMid:   jobSelectMid   !== null ? jobSelectMid   : baseProfile.jobSelectMid,
       toolEnableMid:  toolEnableMid  !== null ? toolEnableMid  : baseProfile.toolEnableMid,
       toolDisableMid: toolDisableMid !== null ? toolDisableMid : baseProfile.toolDisableMid,
-      maxRevision:    maxRevision    !== null ? maxRevision    : baseProfile.maxRevision,
-      supportsAlarms: baseProfile.supportsAlarms !== false
+      maxRevision:    maxRevision    !== null ? maxRevision    : baseProfile.maxRevision
     };
     this._pendingRevision = this.profile.maxRevision;
 
-    this.socket = null;
-    this.buffer = '';
-    this.state = createInitialState();
-
-    this.lastTrafficTs = Date.now();
+    this.socket         = null;
+    this.buffer         = '';
+    this.state          = createInitialState();
+    this.lastTrafficTs  = Date.now();
     this.heartbeatTimer = null;
     this.reconnectTimer = null;
     this.reconnectDelay = RECONNECT_INITIAL_DELAY_MS;
-
-    this.commandSeq = 0;
+    this.commandSeq     = 0;
     this._lastCommandId = null;
     this._pendingVin    = null;
   }
 
   /* =======================================================
      Connection
-  ======================================================= */
+     ======================================================= */
 
   connect() {
     return new Promise((resolve, reject) => {
-      if (this.state.connection.connected) {
-        return resolve();
-      }
+      if (this.state.connection.connected) return resolve();
 
-      this.socket = net.createConnection(
-        { host: this.host, port: this.port },
-        () => {
-          this.state.connection.connected = true;
-          this.state.connection.reconnecting = false;
-          this.state.connection.reconnectAttempts = 0;
-          this.reconnectDelay = RECONNECT_INITIAL_DELAY_MS;
+      this.socket = net.createConnection({ host: this.host, port: this.port }, () => {
+        this.state.connection.connected         = true;
+        this.state.connection.reconnecting      = false;
+        this.state.connection.reconnectAttempts = 0;
+        this.reconnectDelay = RECONNECT_INITIAL_DELAY_MS;
 
-          if (this.configuredSpindleCount !== null) {
-            this.state.tool.spindleCount = this.configuredSpindleCount;
-            this.state.tool.spindleCountSource = 'config';
-          }
-
-          this.emit('connected');
-          this._startHeartbeat();
-          this.sendMID(1);
-          resolve();
+        if (this.configuredSpindleCount !== null) {
+          this.state.tool.spindleCount       = this.configuredSpindleCount;
+          this.state.tool.spindleCountSource = 'config';
         }
-      );
 
-      this.socket.on('data', d => this._onData(d));
+        this.emit('connected');
+        this._startHeartbeat();
+        this.sendMID(1);
+        resolve();
+      });
+
+      this.socket.on('data',  d => this._onData(d));
       this.socket.on('close', () => this._onClose());
       this.socket.on('error', e => {
         this.emit('error', e);
-        if (!this.state.connection.connected) {
-          reject(e);
-        }
+        if (!this.state.connection.connected) reject(e);
       });
     });
   }
@@ -292,10 +328,7 @@ class OpenProtocolNutrunner extends EventEmitter {
   disconnect() {
     this.autoReconnect = false;
     this._stopReconnect();
-    if (this.socket) {
-      this.sendMID(2);
-      this.socket.destroy();
-    }
+    if (this.socket) { this.sendMID(2); this.socket.destroy(); }
   }
 
   _onClose() {
@@ -307,16 +340,16 @@ class OpenProtocolNutrunner extends EventEmitter {
 
     this.state.connection.connected      = false;
     this.state.connection.linkLayerReady = false;
-    this.buffer = '';
-    this._pendingRevision = this.profile.maxRevision;
+    this.buffer               = '';
+    this._pendingRevision     = this.profile.maxRevision;
 
     this.state.controller.ready         = false;
-    this.state.controller.emergencyStop = false; 
+    this.state.controller.emergencyStop = false;
     this.state.tool.enabled             = false;
     this.state.tool.running             = false;
-    this.state.tool.ready               = false; 
-    this.state.tool.direction           = '—';   
-    this.state.tool.processOn           = false; 
+    this.state.tool.ready               = false;
+    this.state.tool.direction           = '—';
+    this.state.tool.processOn           = false;
     this.state.job.active               = false;
     this.state.job.locked               = false;
     this.state.product.vinValid         = false;
@@ -325,22 +358,17 @@ class OpenProtocolNutrunner extends EventEmitter {
     this._pendingVin                    = null;
 
     this.emit('disconnected');
-
-    if (this.autoReconnect && wasConnected) {
-      this._scheduleReconnect();
-    }
+    if (this.autoReconnect && wasConnected) this._scheduleReconnect();
   }
 
   _scheduleReconnect() {
     this._stopReconnect();
     this.state.connection.reconnecting = true;
     this.state.connection.reconnectAttempts++;
-
     this.emit('reconnecting', {
       attempt: this.state.connection.reconnectAttempts,
-      delay: this.reconnectDelay
+      delay:   this.reconnectDelay
     });
-
     this.reconnectTimer = setTimeout(() => {
       this.connect().catch(() => {
         this.reconnectDelay = Math.min(
@@ -353,63 +381,49 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   _stopReconnect() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
   }
 
   /* =======================================================
      Heartbeat
-  ======================================================= */
+     ======================================================= */
 
   _startHeartbeat() {
     this._stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (!this.state.connection.connected) return;
-      const idle = Date.now() - this.lastTrafficTs;
-      if (idle >= HEARTBEAT_INTERVAL_MS) {
-        this.sendMID(9999);
-      }
+      if (Date.now() - this.lastTrafficTs >= HEARTBEAT_INTERVAL_MS) this.sendMID(9999);
     }, 1000);
   }
 
   _stopHeartbeat() {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
   }
 
-  _touchTraffic() {
-    this.lastTrafficTs = Date.now();
-  }
+  _touchTraffic() { this.lastTrafficTs = Date.now(); }
 
   /* =======================================================
      Framing
-  ======================================================= */
+     ======================================================= */
 
   sendMID(mid, payload = '', expectAck = false) {
     this._touchTraffic();
 
     if (expectAck && !this.allowDuplicateCommands) {
-      const hasPending = [...this.state.pendingCommands.values()]
-        .some(c => c.mid === mid);
-
+      const hasPending = [...this.state.pendingCommands.values()].some(c => c.mid === mid);
       if (hasPending) {
-        throw new CommandError(
-          `Command MID ${mid} already pending - wait for ACK or NAK`,
-          mid
-        );
+        throw new CommandError(`Command MID ${mid} already pending - wait for ACK or NAK`, mid);
       }
     }
 
-    const midStr  = mid.toString().padStart(4, '0');
-    const rev     = '001';
-    const noAck   = expectAck ? '0' : '1';
+    const midStr = mid.toString().padStart(4, '0');
+    const rev    = '001';
+    const noAck  = expectAck ? '0' : '1';
     const station = '01';
     const spindle = '01';
-    const spare   = '    ';
+    // FIX: spare must be 8 spaces so that the total header body = 20 bytes:
+    // MID(4) + rev(3) + noAck(1) + station(2) + spindle(2) + spare(8) = 20
+    const spare = '        ';
 
     const headerRest = `${rev}${noAck}${station}${spindle}${spare}`;
     const body = `${midStr}${headerRest}${payload}`;
@@ -431,7 +445,6 @@ class OpenProtocolNutrunner extends EventEmitter {
 
       this.state.pendingCommands.set(cmdId, cmd);
       this._lastCommandId = cmdId;
-
       this.socket.write(`${len}${body}\0`);
       return promise;
     }
@@ -454,7 +467,9 @@ class OpenProtocolNutrunner extends EventEmitter {
 
       const len = parseInt(lenStr, 10);
 
-      if (this.validateFrames && (len < 20 || len > 9999)) {
+      // FIX: `len` is the TOTAL frame size including the 4-byte length prefix.
+      // Open Protocol minimum = 4 (length) + 20 (header body) = 24 total.
+      if (this.validateFrames && (len < MIN_FRAME_SIZE || len > 9999)) {
         this.emit('frameError', { type: 'length_out_of_range', length: len });
         this.buffer = this.buffer.slice(1);
         continue;
@@ -478,15 +493,14 @@ class OpenProtocolNutrunner extends EventEmitter {
 
   /* =======================================================
      MID Parsers
-  ======================================================= */
+     ======================================================= */
 
   _parseMID(mid, p) {
     switch (mid) {
 
       case 2:
       case 3: {
-        const revStr   = p.slice(0, 2).trim();
-        const revision = parseInt(revStr, 10);
+        const revision = parseInt(p.slice(0, 2).trim(), 10);
         return { revision: isNaN(revision) ? 1 : revision };
       }
 
@@ -521,14 +535,9 @@ class OpenProtocolNutrunner extends EventEmitter {
         };
       }
 
-      case 51:
-        return { vin: p.trim() };
-
-      case 52:
-        return { vinRequired: true };
-
-      case 35:
-        return { jobId: Number(p.slice(0, 4)) };
+      case 51: return { vin: p.trim() };
+      case 52: return { vinRequired: true };
+      case 35: return { jobId: Number(p.slice(0, 4)) };
 
       case 31:
         return {
@@ -537,11 +546,8 @@ class OpenProtocolNutrunner extends EventEmitter {
           batchCounter: Number(p.slice(8, 12))
         };
 
-      case 61:
-        return this._parse0061(p);
-
-      case 65:
-        return this._parse0065(p);
+      case 61:  return this._parse0061(p);
+      case 65:  return this._parse0065(p);
 
       case 70:
       case 71:
@@ -562,8 +568,8 @@ class OpenProtocolNutrunner extends EventEmitter {
       case 91:
         return {
           syncTighteningId: p.slice(0, 5),
-          spindleCount: Number(p.slice(5, 7)),
-          syncStatus: p.slice(7, 9)
+          spindleCount:     Number(p.slice(5, 7)),
+          syncStatus:       p.slice(7, 9)
         };
 
       case 101:
@@ -583,6 +589,8 @@ class OpenProtocolNutrunner extends EventEmitter {
     const rev = this.state.protocol.revision;
 
     if (this.profile.isSimulator) {
+      // Simulator profile: tagged field layout with 2-byte field IDs before each value.
+      // Angles are whole integers per OP Spec Rev 1 (no scaling).
       return {
         cellId:         Number(p.slice(2, 6)),
         channelId:      Number(p.slice(8, 10)),
@@ -595,13 +603,10 @@ class OpenProtocolNutrunner extends EventEmitter {
         ok:             p[87] === '1',
         torqueStatus:   p[90],
         angleStatus:    p[93],
-        // Torque has implicit decimals in OP (divide by 100)
-        torqueMin:      Number(p.slice(96, 102))  / 100,
+        torqueMin:      Number(p.slice(96,  102)) / 100,
         torqueMax:      Number(p.slice(104, 110)) / 100,
         torqueTarget:   Number(p.slice(112, 118)) / 100,
         torque:         Number(p.slice(120, 126)) / 100,
-        // Angles are strict whole numbers (integers) in OP Rev 1.
-        // The simulator mechanically truncates decimals before sending over TCP.
         angleMin:       Number(p.slice(128, 133)),
         angleMax:       Number(p.slice(135, 140)),
         angleTarget:    Number(p.slice(142, 147)),
@@ -614,7 +619,13 @@ class OpenProtocolNutrunner extends EventEmitter {
       };
     }
 
-    // Standard Open Protocol strict positional layout (Rev 1 & 4)
+    // ── Standard Open Protocol positional layout ────────────────────────────
+    //
+    // Rev 1 & Rev 4 share the same field layout. Rev 1 does NOT carry an
+    // explicit spindle number — the spindle field is hardcoded to 1 here.
+    // For genuine multi-spindle real hardware, subscribe at Rev 2+ so the
+    // controller sends an explicit spindle number per result.
+    //
     if (rev === 1 || rev === 4) {
       return {
         cellId:         Number(p.slice(0, 4)),
@@ -632,19 +643,19 @@ class OpenProtocolNutrunner extends EventEmitter {
         torqueMax:      Number(p.slice(80, 86))  / 100,
         torqueTarget:   Number(p.slice(86, 92))  / 100,
         torque:         Number(p.slice(92, 98))  / 100,
-        angleMin:       Number(p.slice(98, 103)),
+        angleMin:       Number(p.slice(98,  103)),
         angleMax:       Number(p.slice(103, 108)),
         angleTarget:    Number(p.slice(108, 113)),
-        angle:          Number(p.slice(113, 118)), 
+        angle:          Number(p.slice(113, 118)),
         timestamp:      p.slice(118, 137),
         lastPsetChange: p.slice(137, 156),
         batchStatus:    p[156],
         tighteningId:   p.slice(157, 167),
-        spindle:        1
+        spindle:        1   // Rev 1/4: no spindle field; use tighteningId as Map key
       };
     }
 
-    // Rev 2 & 3 fallback
+    // Rev 2 & 3 fallback (compact layout)
     const torqueStatus = p.charAt(42) || '0';
     const angleStatus  = p.charAt(43) || '0';
     const batchStatus  = p.charAt(49) || '0';
@@ -693,7 +704,7 @@ class OpenProtocolNutrunner extends EventEmitter {
 
   /* =======================================================
      MID → State
-  ======================================================= */
+     ======================================================= */
 
   _handleMID(mid, d) {
     this.state.connection.lastMID = mid;
@@ -705,12 +716,8 @@ class OpenProtocolNutrunner extends EventEmitter {
         this.state.protocol.revision         = d.revision;
         this.state.connection.linkLayerReady = true;
         this.emit('linkEstablished', { revision: d.revision });
-        
         this.subscribeTighteningResults();
-        
-        if (this.profile.supportsAlarms) {
-          this.subscribeAlarms();
-        }
+        if (this.profile.supportsAlarms) this.subscribeAlarms();
         break;
 
       case 4:
@@ -778,24 +785,22 @@ class OpenProtocolNutrunner extends EventEmitter {
         this.state.controller.ready         = d.controllerReady;
         this.state.controller.errorActive   = d.alarmActive;
         this.state.controller.emergencyStop = d.emergencyStop;
-        this.state.tool.ready               = d.toolReady; 
+        this.state.tool.ready               = d.toolReady;
         this.state.tool.enabled             = d.toolEnabled;
         this.state.tool.running             = d.toolRunning;
-        this.state.tool.direction           = d.direction; 
-        this.state.tool.processOn           = d.processOn; 
+        this.state.tool.direction           = d.direction;
+        this.state.tool.processOn           = d.processOn;
 
-        if (d.direction !== prevDirection && d.direction !== '—') {
+        if (d.direction !== prevDirection && d.direction !== '—')
           this.emit('directionChanged', { direction: d.direction });
-        }
 
         if (d.emergencyStop && !prevEmergency)
           this.emit('emergencyStop', { active: true });
         else if (!d.emergencyStop && prevEmergency)
           this.emit('emergencyStop', { active: false });
 
-        if (d.toolRunning && !prevRunning && !this.state.tightening.inProgress) {
+        if (d.toolRunning && !prevRunning && !this.state.tightening.inProgress)
           this._startTighteningCycle();
-        }
         break;
       }
 
@@ -810,9 +815,9 @@ class OpenProtocolNutrunner extends EventEmitter {
         break;
 
       case 35:
-        this.state.job.jobId  = d.jobId;
-        this.state.job.active = true;
-        this.state.job.locked = true;
+        this.state.job.jobId         = d.jobId;
+        this.state.job.active        = true;
+        this.state.job.locked        = true;
         this.state.product.vinLocked = false;
         this.emit('jobSelected', { jobId: d.jobId });
         break;
@@ -831,12 +836,23 @@ class OpenProtocolNutrunner extends EventEmitter {
         this.emit('batchStarted', this.state.batch);
         break;
 
+      // FIX: MID 0061 and MID 0065 require DIFFERENT ACK MIDs.
+      // MID 0061 → ACK with MID 0062
+      // MID 0065 → ACK with MID 0066
+      // Sending MID 0062 for MID 0065 is a protocol violation on real hardware.
       case 61:
+        try {
+          this._handleTighteningResult(d, 61);
+        } catch (err) {
+          this.emit('parseError', { mid: 61, error: err.message });
+        }
+        break;
+
       case 65:
         try {
-          this._handleTighteningResult(d);
-        } finally {
-          this.sendMID(62);
+          this._handleTighteningResult(d, 65);
+        } catch (err) {
+          this.emit('parseError', { mid: 65, error: err.message });
         }
         break;
 
@@ -857,16 +873,18 @@ class OpenProtocolNutrunner extends EventEmitter {
 
       case 91:
         if (d.spindleCount > 0 && this.state.tool.spindleCountSource !== 'config') {
-          this.state.tool.spindleCount = d.spindleCount;
+          this.state.tool.spindleCount       = d.spindleCount;
           this.state.tool.spindleCountSource = 'mid091';
         }
         this.emit('multiSpindleStatus', d);
         break;
 
       case 101:
-        if (this.state.tool.spindleCountSource !== 'config' &&
-            this.state.tool.spindleCountSource !== 'manual' &&
-            d.spindleCount > 0) {
+        if (
+          this.state.tool.spindleCountSource !== 'config' &&
+          this.state.tool.spindleCountSource !== 'manual' &&
+          d.spindleCount > 0
+        ) {
           this.state.tool.spindleCount       = d.spindleCount;
           this.state.tool.spindleCountSource = 'mid101';
           this.emit('spindleCountUpdated', { count: d.spindleCount, source: 'mid101' });
@@ -910,21 +928,25 @@ class OpenProtocolNutrunner extends EventEmitter {
 
   /* =======================================================
      Tightening Lifecycle
-  ======================================================= */
+     ======================================================= */
 
   _startTighteningCycle() {
-    this.state.tightening.inProgress  = true;
+    // FIX: Clear pendingSpindles at cycle start to ensure no stale results
+    // from a previous timed-out cycle can mix with results from this cycle.
+    this.state.tightening.pendingSpindles.clear();
+    this.state.tightening.inProgress   = true;
     this.state.tightening.cycleStartTs = Date.now();
     this._startWatchdog();
-    this.emit('tighteningCycleStarted', { 
+    this.emit('tighteningCycleStarted', {
       timestamp: this.state.tightening.cycleStartTs,
       direction: this.state.tool.direction
     });
   }
 
-  _handleTighteningResult(d) {
+  _handleTighteningResult(d, sourceMid) {
     if (!this.state.tightening.inProgress || this.state.tightening.cycleStartTs === null) {
-      this.state.tightening.inProgress  = true;
+      this.state.tightening.pendingSpindles.clear();
+      this.state.tightening.inProgress   = true;
       this.state.tightening.cycleStartTs = Date.now();
     }
 
@@ -938,20 +960,30 @@ class OpenProtocolNutrunner extends EventEmitter {
       this.emit('vinLocked', this.state.product.vin);
     }
 
-    if (this.state.tool.spindleCountSource === 'default' &&
-        d.spindle > this.state.tool.spindleCount) {
+    // FIX: Use tighteningId as the Map key (not spindle number).
+    // Rev 1 & Rev 4 hardcode spindle=1, so using spindle as key would cause
+    // every result to overwrite the same map entry — the cycle would never
+    // complete for multi-spindle heads. tighteningId is unique per result.
+    const key = d.tighteningId || String(d.spindle);
+
+    if (
+      this.state.tool.spindleCountSource === 'default' &&
+      d.spindle > this.state.tool.spindleCount
+    ) {
       this.state.tool.spindleCount       = d.spindle;
       this.state.tool.spindleCountSource = 'mid061';
       this.emit('spindleCountUpdated', { count: d.spindle, source: 'mid061' });
     }
 
     this.emit('spindleResult', d);
-    this.state.tightening.pendingSpindles.set(d.spindle, d);
+    this.state.tightening.pendingSpindles.set(key, d);
 
     if (this.state.tightening.pendingSpindles.size < this.state.tool.spindleCount) {
+      // Not all spindles received yet — withhold ACK and batch completion.
       return;
     }
 
+    // All spindle results for this cycle have arrived.
     this._clearWatchdog();
 
     const results   = [...this.state.tightening.pendingSpindles.values()];
@@ -960,6 +992,16 @@ class OpenProtocolNutrunner extends EventEmitter {
     this.state.tightening.pendingSpindles.clear();
     this.state.tightening.inProgress = false;
 
+    // FIX: Send the correct ACK only ONCE per cycle (after all spindles arrive),
+    // not once per individual spindle result. This prevents ACK flooding on
+    // strict multi-spindle controllers (e.g. Atlas Copco Power Focus).
+    // MID 0062 = ACK for MID 0061
+    // MID 0066 = ACK for MID 0065
+    this.sendMID(sourceMid === 65 ? 66 : 62);
+
+    // batch.counter semantics: one unit = one completed tightening CYCLE
+    // (all spindles finished). This matches the controller's own MID 0031
+    // batch counter behaviour.
     if (this.state.batch.active && !this.state.batch.complete) {
       this.state.batch.counter++;
       this.emit('batchProgress', {
@@ -974,8 +1016,8 @@ class OpenProtocolNutrunner extends EventEmitter {
       }
     }
 
-    this.emit('tighteningCycleCompleted', { 
-      results, 
+    this.emit('tighteningCycleCompleted', {
+      results,
       overallOk,
       duration: Date.now() - this.state.tightening.cycleStartTs
     });
@@ -987,7 +1029,7 @@ class OpenProtocolNutrunner extends EventEmitter {
       const partialResults = [...this.state.tightening.pendingSpindles.values()];
       this.state.tightening.inProgress = false;
       this.state.tightening.pendingSpindles.clear();
-      this.emit('tighteningIncomplete', { 
+      this.emit('tighteningIncomplete', {
         expected: this.state.tool.spindleCount,
         received: partialResults.length,
         results:  partialResults
@@ -1004,46 +1046,27 @@ class OpenProtocolNutrunner extends EventEmitter {
 
   /* =======================================================
      Interlocks
-  ======================================================= */
+     ======================================================= */
 
   _check(cmd) {
     const s = this.state;
-
-    if (!s.connection.connected) {
-      throw new InterlockError('NOT_CONNECTED', 'Controller not connected');
-    }
-    if (!s.connection.linkLayerReady) {
-      throw new InterlockError('LINK_NOT_READY', 'Link layer not established');
-    }
+    if (!s.connection.connected)      throw new InterlockError('NOT_CONNECTED',  'Controller not connected');
+    if (!s.connection.linkLayerReady) throw new InterlockError('LINK_NOT_READY', 'Link layer not established');
 
     if (cmd === 'startTightening') {
-      if (!s.tool.enabled) {
-        throw new InterlockError('TOOL_DISABLED', 'Tool is disabled');
-      }
-      if (s.tool.running) {
-        throw new InterlockError('TOOL_RUNNING', 'Tool already running');
-      }
-      if (!s.controller.ready) {
-        throw new InterlockError('CTRL_NOT_READY', 'Controller not ready');
-      }
-      if (s.controller.errorActive) {
-        throw new InterlockError('ALARM_ACTIVE', 'Controller alarm active');
-      }
-      if (s.controller.emergencyStop) {                         
-        throw new InterlockError('EMERGENCY_STOP', 'Emergency stop is active');
-      }
-      if (s.product.vinRequired && !s.product.vinValid) {
-        throw new InterlockError('VIN_REQUIRED', 'Valid VIN required');
-      }
-      if (!s.job.active) {
-        throw new InterlockError('JOB_NOT_ACTIVE', 'No job selected');
-      }
+      if (!s.tool.enabled)                              throw new InterlockError('TOOL_DISABLED',  'Tool is disabled');
+      if (s.tool.running)                               throw new InterlockError('TOOL_RUNNING',   'Tool already running');
+      if (!s.controller.ready)                          throw new InterlockError('CTRL_NOT_READY', 'Controller not ready');
+      if (s.controller.errorActive)                     throw new InterlockError('ALARM_ACTIVE',   'Controller alarm active');
+      if (s.controller.emergencyStop)                   throw new InterlockError('EMERGENCY_STOP', 'Emergency stop is active');
+      if (s.product.vinRequired && !s.product.vinValid) throw new InterlockError('VIN_REQUIRED',   'Valid VIN required');
+      if (!s.job.active)                                throw new InterlockError('JOB_NOT_ACTIVE',  'No job selected');
     }
   }
 
   /* =======================================================
-     Public API - Subscriptions
-  ======================================================= */
+     Public API — Subscriptions
+     ======================================================= */
 
   subscribeTighteningResults(revision = null) {
     const rev = revision !== null ? revision : this.profile.maxRevision;
@@ -1073,9 +1096,29 @@ class OpenProtocolNutrunner extends EventEmitter {
     );
   }
 
+  subscribeMultiSpindleStatus() {
+    this.sendMID(90, '', true).catch(() => {});
+    this.state.protocol.subscriptions.multiSpindleStatus = true;
+  }
+
+  unsubscribeMultiSpindleStatus() {
+    this.sendMID(93);
+    this.state.protocol.subscriptions.multiSpindleStatus = false;
+  }
+
+  subscribeMultiSpindleResults() {
+    this.sendMID(100, '', true).catch(() => {});
+    this.state.protocol.subscriptions.multiSpindleResults = true;
+  }
+
+  unsubscribeMultiSpindleResults() {
+    this.sendMID(103);
+    this.state.protocol.subscriptions.multiSpindleResults = false;
+  }
+
   /* =======================================================
-     Public API - Commands
-  ======================================================= */
+     Public API — Commands
+     ======================================================= */
 
   startTightening() {
     this._check('startTightening');
@@ -1104,53 +1147,23 @@ class OpenProtocolNutrunner extends EventEmitter {
     return this.sendMID(20, '', true);
   }
 
-  decrementBatch() {
-    return this.sendMID(21, '', true);
-  }
+  decrementBatch() { return this.sendMID(21, '', true); }
 
-  /* =======================================================
-     Public API - Batch & Simulator Controls
-  ======================================================= */
-
-  // MID 0019: Set Batch Size (Simulator uses this to reset batches)
+  // MID 0019: Set Batch Size (forces batch counter reset on controller side)
   setBatchSize(paramSetId, size) {
     const psetStr = paramSetId.toString().padStart(3, '0');
     const sizeStr = size.toString().padStart(4, '0');
     return this.sendMID(19, `${psetStr}${sizeStr}`, true);
   }
 
-  // MID 0128: Job Batch Increment (Used in simulator to skip a NOK bolt)
+  // MID 0128: Job Batch Increment — skip a NOK bolt in strict batching mode
   skipBolt() {
     return this.sendMID(128, '', true);
   }
 
   /* =======================================================
-     Public API - Multi-Spindle Subscriptions
-  ======================================================= */
-
-  subscribeMultiSpindleStatus() {
-    this.sendMID(90, '', true).catch(() => {});
-    this.state.protocol.subscriptions.multiSpindleStatus = true;
-  }
-
-  unsubscribeMultiSpindleStatus() {
-    this.sendMID(93);
-    this.state.protocol.subscriptions.multiSpindleStatus = false;
-  }
-
-  subscribeMultiSpindleResults() {
-    this.sendMID(100, '', true).catch(() => {});
-    this.state.protocol.subscriptions.multiSpindleResults = true;
-  }
-
-  unsubscribeMultiSpindleResults() {
-    this.sendMID(103);
-    this.state.protocol.subscriptions.multiSpindleResults = false;
-  }
-
-  /* =======================================================
-     Public API - Configuration
-  ======================================================= */
+     Public API — Configuration
+     ======================================================= */
 
   setSpindleCount(count) {
     if (count < 1 || count > 99) throw new Error('Spindle count must be between 1 and 99');
@@ -1160,40 +1173,30 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   /* =======================================================
-     Public API - State
-  ======================================================= */
+     Public API — State
+     ======================================================= */
 
   getState() {
     return JSON.parse(JSON.stringify(this.state, (key, val) => {
-      if (val instanceof Map) return [...val.values()];
+      if (val instanceof Map)                                            return [...val.values()];
       if (val instanceof Object && val.constructor?.name === 'Timeout') return undefined;
       return val;
     }));
   }
 
-  isConnected() {
-    return this.state.connection.connected;
-  }
+  isConnected() { return this.state.connection.connected; }
 
   isReady() {
     return this.state.connection.connected
-        && this.state.connection.linkLayerReady
-        && this.state.controller.ready
-        && !this.state.controller.errorActive
-        && !this.state.controller.emergencyStop;
+      && this.state.connection.linkLayerReady
+      && this.state.controller.ready
+      && !this.state.controller.errorActive
+      && !this.state.controller.emergencyStop;
   }
 
   getSpindleCount() {
-    return {
-      count:  this.state.tool.spindleCount,
-      source: this.state.tool.spindleCountSource
-    };
+    return { count: this.state.tool.spindleCount, source: this.state.tool.spindleCountSource };
   }
 }
 
-module.exports = {
-  OpenProtocolNutrunner,
-  InterlockError,
-  ProtocolError,
-  CommandError
-};
+module.exports = { OpenProtocolNutrunner, InterlockError, ProtocolError, CommandError };
