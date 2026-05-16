@@ -2,6 +2,23 @@
 
 ---
 
+## [1.2.7] - Real Hardware Multi-Spindle Fix - 2026-05-16
+
+### Fixed
+- **Header Spare Field Padding:** Corrected the `sendMID` spare field to 8 spaces (was 4). TX frames now correctly emit 20-byte header bodies per the Open Protocol spec, resolving "Message too short: expected at least 20 bytes, got 18" parse errors.
+- **Minimum Frame Size Validation:** Corrected the frame validation threshold from `len < 20` to `len < 24` (`MIN_FRAME_SIZE`). The length prefix dictates the total frame size, making 24 bytes the true minimum.
+- **MID 0065 ACK Protocol Violation:** MID 0065 (Multi-Spindle Result) now correctly acknowledges with MID 0066. Previously, it sent MID 0062, which is a protocol violation against real hardware.
+- **Stale Spindle Results:** The `pendingSpindles` map is now explicitly cleared at the start of each new tightening cycle, preventing stale results from a timed-out cycle from contaminating new data.
+- **Multi-Spindle Rev 1 Map Keying:** `pendingSpindles` is now keyed by `tighteningId` instead of the spindle number. Open Protocol Rev 1 does not carry an explicit spindle field, which previously caused all results to overwrite the same map entry.
+- **ACK Flooding:** MID 0062 and MID 0066 are now sent only once per overall tightening cycle (after all spindles have accumulated), rather than once per individual spindle result. This resolves ACK flooding disconnections on strict multi-spindle controllers like the Atlas Copco Power Focus.
+
+### Changed
+- **Batch Counter Semantics Clarified:** The `batch.counter` now definitively tracks the number of completed cycles (where one cycle means all spindles tightened once). This precisely mirrors how the hardware controller's internal batch counter operates under MID 0031.
+
+---
+
+
+
 ## [1.2.6] - Simulator Support & Multi-Spindle Updates - 2026-05-15
 
 ### Added
