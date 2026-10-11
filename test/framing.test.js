@@ -221,17 +221,13 @@ test('parsers receive the revision from each frame header', async () => {
   await setup();
   const headers = [];
   const orig = client._parseMID.bind(client);
-  client._parseMID = (mid, p, h) => { headers.push({ mid, ...h }); return orig(mid, p, h); };
+  client._parseMID = (mid, p, rev) => { headers.push([mid, rev]); return orig(mid, p, rev); };
   client.state.protocol.revision = 4; // requested, but the controller answers at rev 1
 
   ctrl.send(frame(9999, '', 0), frame(5, '0060', 1), frame(5, '0060', 3));
   await new Promise(r => setTimeout(r, 50));
 
-  assert.deepEqual(headers.map(h => [h.mid, h.revision, h.length]), [
-    [9999, 1, 20],
-    [5, 1, 24],
-    [5, 3, 24]
-  ]);
+  assert.deepEqual(headers, [[9999, 1], [5, 1], [5, 3]]);
   assert.equal(client._rxRevision, 3);
 });
 
@@ -239,11 +235,11 @@ test('blank header revision means revision 1', async () => {
   await setup();
   const headers = [];
   const orig = client._parseMID.bind(client);
-  client._parseMID = (mid, p, h) => { headers.push(h); return orig(mid, p, h); };
+  client._parseMID = (mid, p, rev) => { headers.push(rev); return orig(mid, p, rev); };
 
   const blank = Buffer.from('00209999   0        \0', 'latin1');
   assert.equal(blank.length, 21);
   ctrl.send(blank);
   await new Promise(r => setTimeout(r, 50));
-  assert.equal(headers[0].revision, 1);
+  assert.equal(headers[0], 1);
 });

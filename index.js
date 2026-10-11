@@ -535,7 +535,7 @@ class OpenProtocolNutrunner extends EventEmitter {
       const payload = frame.slice(HEADER_SIZE);
 
       try {
-        const parsed = this._parseMID(mid, payload, header);
+        const parsed = this._parseMID(mid, payload, header.revision);
         this._handleMID(mid, parsed);
       } catch (err) {
         this.emit('parseError', { mid, error: err.message });
@@ -547,10 +547,10 @@ class OpenProtocolNutrunner extends EventEmitter {
      MID Parsers
      ======================================================= */
 
-  // `header.revision` is the revision the controller actually sent this
-  // frame at; layouts must follow it, not the revision that was requested.
-  _parseMID(mid, p, header = null) {
-    this._rxRevision = header ? header.revision : null;
+  // `rev` is the header revision the controller actually sent this frame at
+  // (blank/000/001 => 1); layouts must follow it, not the requested revision.
+  _parseMID(mid, p, rev) {
+    this._rxRevision = rev || null;
     switch (mid) {
 
       case 2:
