@@ -316,10 +316,14 @@ main().catch(console.error);
 
 | Event | Payload | Description |
 |---|---|---|
-| `tighteningCycleStarted` | `{ timestamp }` | Tool running signal detected |
-| `spindleResult` | result object | Individual spindle result (fires once per spindle) |
+| `tighteningCycleStarted` | `{ timestamp }` | First MID 0061 result of a new cycle received |
+| `spindleResult` | result object | One MID 0061 result (fires once per result; each is ACKed with MID 0062 immediately) |
 | `tighteningCycleCompleted` | `{ results, overallOk, duration }` | All spindles collected |
 | `tighteningIncomplete` | `{ expected, received, results }` | Watchdog fired before all spindles arrived |
+| `oldTighteningResult` | result object | MID 0065 reply to `requestOldTighteningResult()` (not counted toward the batch) |
+| `toolData` | tool data object | MID 0041 reply to `requestToolData()` |
+
+Result objects carry `revision` (the MID 0061 layout they were parsed with) plus the fields of that revision: rev 1 is tagged parameters 01-23, revs 2-7 are tagged parameters 01-57 (strategy, error status, rundown/current/self-tap/prevail values, pset name, torque unit, identifier parts, ...), rev 999 is the untagged light layout. MID 0061 carries no spindle number, so `spindle` is always 1. Parameters newer than this library knows are returned in `unparsed`. A result that cannot be parsed is still acknowledged and reported through `parseError`.
 
 ### Command Events
 
@@ -374,9 +378,9 @@ try {
 |---|---|
 | `NOT_CONNECTED` | TCP connection not established |
 | `LINK_NOT_READY` | Open Protocol handshake not complete |
-| `TOOL_DISABLED` | Tool not enabled via `enableTool()` |
+| `TOOL_DISABLED` | Tool not enabled via `enableTool()` (set when the controller ACKs MID 0043) |
 | `TOOL_RUNNING` | Tightening already in progress |
-| `CTRL_NOT_READY` | Controller not ready (MID 0041 flag) |
+| `CTRL_NOT_READY` | Controller has not answered MID 0001 with MID 0002 |
 | `ALARM_ACTIVE` | Active alarm must be acknowledged first |
 | `VIN_REQUIRED` | VIN required by controller but not yet downloaded |
 | `JOB_NOT_ACTIVE` | No job selected |
@@ -405,6 +409,13 @@ await nutrunner.disableTool()                  // MID 0042 or brand-specific MID
 await nutrunner.startTightening()              // Interlocks enforced — throws InterlockError
 await nutrunner.resetBatch()                   // MID 0020
 await nutrunner.decrementBatch()               // MID 0021
+```
+
+### Data Requests
+
+```javascript
+await nutrunner.requestToolData()                       // MID 0040 → resolves with MID 0041 tool data
+await nutrunner.requestOldTighteningResult(tighteningId) // MID 0064 → resolves with MID 0065 (0 = latest)
 ```
 
 ### Subscriptions

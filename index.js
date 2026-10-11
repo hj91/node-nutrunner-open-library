@@ -173,6 +173,270 @@ const BRAND_PROFILES = {
 };
 
 /* =========================================================
+   MID Field Tables
+   =========================================================
+   Tagged MID data is a sequence of <2-digit parameter ID><fixed-width value>.
+   Each row: [paramId, name, width, type, minRevision]
+     int  → Number          str  → trimmed string
+     raw  → untrimmed string    char → single status digit (string)
+     x100 → Number / 100 (torque values carry two implied decimals)
+*/
+
+const MID0061_REV1_FIELDS = [
+  ['01', 'cellId',          4, 'int'],
+  ['02', 'channelId',       2, 'int'],
+  ['03', 'controllerName', 25, 'str'],
+  ['04', 'vin',            25, 'str'],
+  ['05', 'jobId',           2, 'int'],
+  ['06', 'paramSetId',      3, 'int'],
+  ['07', 'batchSize',       4, 'int'],
+  ['08', 'batchCounter',    4, 'int'],
+  ['09', 'tighteningStatus',1, 'char'],
+  ['10', 'torqueStatus',    1, 'char'],
+  ['11', 'angleStatus',     1, 'char'],
+  ['12', 'torqueMin',       6, 'x100'],
+  ['13', 'torqueMax',       6, 'x100'],
+  ['14', 'torqueTarget',    6, 'x100'],
+  ['15', 'torque',          6, 'x100'],
+  ['16', 'angleMin',        5, 'int'],
+  ['17', 'angleMax',        5, 'int'],
+  ['18', 'angleTarget',     5, 'int'],
+  ['19', 'angle',           5, 'int'],
+  ['20', 'timestamp',      19, 'str'],
+  ['21', 'lastPsetChange', 19, 'str'],
+  ['22', 'batchStatus',     1, 'char'],
+  ['23', 'tighteningId',   10, 'raw']
+];
+
+// Revisions 2-7 share one parameter numbering; later revisions append fields.
+const MID0061_REV2_FIELDS = [
+  ['01', 'cellId',                         4, 'int',  2],
+  ['02', 'channelId',                      2, 'int',  2],
+  ['03', 'controllerName',                25, 'str',  2],
+  ['04', 'vin',                           25, 'str',  2],
+  ['05', 'jobId',                          4, 'int',  2],
+  ['06', 'paramSetId',                     3, 'int',  2],
+  ['07', 'strategy',                       2, 'int',  2],
+  ['08', 'strategyOptions',                5, 'raw',  2],
+  ['09', 'batchSize',                      4, 'int',  2],
+  ['10', 'batchCounter',                   4, 'int',  2],
+  ['11', 'tighteningStatus',               1, 'char', 2],
+  ['12', 'batchStatus',                    1, 'char', 2],
+  ['13', 'torqueStatus',                   1, 'char', 2],
+  ['14', 'angleStatus',                    1, 'char', 2],
+  ['15', 'rundownAngleStatus',             1, 'char', 2],
+  ['16', 'currentMonitoringStatus',        1, 'char', 2],
+  ['17', 'selftapStatus',                  1, 'char', 2],
+  ['18', 'prevailTorqueMonitoringStatus',  1, 'char', 2],
+  ['19', 'prevailTorqueCompensateStatus',  1, 'char', 2],
+  ['20', 'tighteningErrorStatus',         10, 'int',  2],
+  ['21', 'torqueMin',                      6, 'x100', 2],
+  ['22', 'torqueMax',                      6, 'x100', 2],
+  ['23', 'torqueTarget',                   6, 'x100', 2],
+  ['24', 'torque',                         6, 'x100', 2],
+  ['25', 'angleMin',                       5, 'int',  2],
+  ['26', 'angleMax',                       5, 'int',  2],
+  ['27', 'angleTarget',                    5, 'int',  2],
+  ['28', 'angle',                          5, 'int',  2],
+  ['29', 'rundownAngleMin',                5, 'int',  2],
+  ['30', 'rundownAngleMax',                5, 'int',  2],
+  ['31', 'rundownAngle',                   5, 'int',  2],
+  ['32', 'currentMonitoringMin',           3, 'int',  2],
+  ['33', 'currentMonitoringMax',           3, 'int',  2],
+  ['34', 'currentMonitoringValue',         3, 'int',  2],
+  ['35', 'selftapMin',                     6, 'x100', 2],
+  ['36', 'selftapMax',                     6, 'x100', 2],
+  ['37', 'selftapTorque',                  6, 'x100', 2],
+  ['38', 'prevailTorqueMonitoringMin',     6, 'x100', 2],
+  ['39', 'prevailTorqueMonitoringMax',     6, 'x100', 2],
+  ['40', 'prevailTorque',                  6, 'x100', 2],
+  ['41', 'tighteningId',                  10, 'raw',  2],
+  ['42', 'jobSequenceNumber',              5, 'int',  2],
+  ['43', 'syncTighteningId',               5, 'int',  2],
+  ['44', 'toolSerialNumber',              14, 'str',  2],
+  ['45', 'timestamp',                     19, 'str',  2],
+  ['46', 'lastPsetChange',                19, 'str',  2],
+  ['47', 'paramSetName',                  25, 'str',  3],
+  ['48', 'torqueUnit',                     1, 'char', 3],
+  ['49', 'resultType',                     2, 'int',  3],
+  ['50', 'identifierPart2',               25, 'str',  4],
+  ['51', 'identifierPart3',               25, 'str',  4],
+  ['52', 'identifierPart4',               25, 'str',  4],
+  ['53', 'customerErrorCode',              4, 'str',  5],
+  ['54', 'prevailTorqueCompensateValue',   6, 'x100', 6],
+  ['55', 'tighteningErrorStatus2',        10, 'int',  6],
+  ['56', 'compensatedAngle',               7, 'x100', 7],
+  ['57', 'finalAngleDecimal',              7, 'x100', 7]
+];
+
+// Revision 999 ("light"): untagged, fixed positions.
+const MID0061_REV999_FIELDS = [
+  ['vin',              25, 'str'],
+  ['jobId',             2, 'int'],
+  ['paramSetId',        3, 'int'],
+  ['batchSize',         4, 'int'],
+  ['batchCounter',      4, 'int'],
+  ['batchStatus',       1, 'char'],
+  ['tighteningStatus',  1, 'char'],
+  ['torqueStatus',      1, 'char'],
+  ['angleStatus',       1, 'char'],
+  ['torque',            6, 'x100'],
+  ['angle',             5, 'int'],
+  ['timestamp',        19, 'str'],
+  ['lastPsetChange',   19, 'str'],
+  ['tighteningId',     10, 'raw']
+];
+
+// MID 0065: Old tightening result upload reply (answer to MID 0064).
+const MID0065_REV1_FIELDS = [
+  ['01', 'tighteningId',     10, 'raw'],
+  ['02', 'vin',              25, 'str'],
+  ['03', 'paramSetId',        3, 'int'],
+  ['04', 'batchCounter',      4, 'int'],
+  ['05', 'tighteningStatus',  1, 'char'],
+  ['06', 'torqueStatus',      1, 'char'],
+  ['07', 'angleStatus',       1, 'char'],
+  ['08', 'torque',            6, 'x100'],
+  ['09', 'angle',             5, 'int'],
+  ['10', 'timestamp',        19, 'str'],
+  ['11', 'batchStatus',       1, 'char']
+];
+
+const MID0065_REV2_FIELDS = [
+  ['01', 'tighteningId',                  10, 'raw'],
+  ['02', 'vin',                           25, 'str'],
+  ['03', 'paramSetId',                     3, 'int'],
+  ['04', 'strategy',                       2, 'int'],
+  ['05', 'strategyOptions',                5, 'raw'],
+  ['06', 'batchCounter',                   4, 'int'],
+  ['07', 'batchStatus',                    1, 'char'],
+  ['08', 'tighteningStatus',               1, 'char'],
+  ['09', 'torqueStatus',                   1, 'char'],
+  ['10', 'angleStatus',                    1, 'char'],
+  ['11', 'rundownAngleStatus',             1, 'char'],
+  ['12', 'currentMonitoringStatus',        1, 'char'],
+  ['13', 'selftapStatus',                  1, 'char'],
+  ['14', 'prevailTorqueMonitoringStatus',  1, 'char'],
+  ['15', 'prevailTorqueCompensateStatus',  1, 'char'],
+  ['16', 'tighteningErrorStatus',         10, 'int'],
+  ['17', 'torque',                         6, 'x100'],
+  ['18', 'angle',                          5, 'int'],
+  ['19', 'rundownAngle',                   5, 'int'],
+  ['20', 'currentMonitoringValue',         3, 'int'],
+  ['21', 'selftapTorque',                  6, 'x100'],
+  ['22', 'prevailTorque',                  6, 'x100'],
+  ['23', 'jobSequenceNumber',              5, 'int'],
+  ['24', 'syncTighteningId',               5, 'int'],
+  ['25', 'toolSerialNumber',              14, 'str'],
+  ['26', 'timestamp',                     19, 'str']
+];
+
+// MID 0041: Tool data upload reply (answer to MID 0040).
+const MID0041_FIELDS = [
+  ['01', 'toolSerialNumber',          14, 'str',  1],
+  ['02', 'tighteningCount',           10, 'int',  1],
+  ['03', 'lastCalibrationDate',       19, 'str',  1],
+  ['04', 'controllerSerialNumber',    10, 'str',  1],
+  ['05', 'calibrationValue',           6, 'x100', 2],
+  ['06', 'lastServiceDate',           19, 'str',  2],
+  ['07', 'tighteningsSinceService',   10, 'int',  2],
+  ['08', 'toolType',                   2, 'int',  2],
+  ['09', 'motorSize',                  2, 'int',  2],
+  ['10', 'openEndData',                3, 'raw',  2],
+  ['11', 'controllerSoftwareVersion', 19, 'str',  2],
+  ['12', 'toolMaxTorque',              6, 'x100', 3],
+  ['13', 'toolGearRatio',              6, 'x100', 3],
+  ['14', 'toolFullSpeed',              6, 'x100', 3],
+  ['15', 'primaryTool',                2, 'int',  4]
+];
+
+const TORQUE_UNITS = {
+  '1': 'Nm', '2': 'Lbf.ft', '3': 'Lbf.In', '4': 'Kpm',
+  '5': 'Kgf.cm', '6': 'ozf.in', '7': '%', '8': 'Ncm'
+};
+
+function convertField(value, type) {
+  switch (type) {
+    case 'int':  return Number(value.trim());
+    case 'x100': return Number(value.trim()) / 100;
+    case 'str':  return value.trim();
+    default:     return value;          // 'raw', 'char'
+  }
+}
+
+/**
+ * Parse tagged MID data against a field table.
+ * Parameter IDs are consecutive, starting at 01. Parsing stops at the first
+ * parameter ID the table does not know (a newer revision than this library
+ * implements); the remainder is returned as `unparsed`.
+ * Throws ProtocolError on malformed data.
+ */
+function parseTagged(mid, p, table) {
+  const byId   = new Map(table.map(row => [row[0], row]));
+  const out    = {};
+  let pos      = 0;
+  let lastId   = 0;
+  let maxRev   = 1;
+
+  while (pos < p.length) {
+    const id = p.slice(pos, pos + 2);
+    if (!/^\d{2}$/.test(id)) {
+      throw new ProtocolError(`MID ${mid}: invalid parameter ID "${id}" at offset ${pos}`, mid);
+    }
+    if (Number(id) !== lastId + 1) {
+      throw new ProtocolError(`MID ${mid}: expected parameter ${lastId + 1}, got ${id} at offset ${pos}`, mid);
+    }
+    const row = byId.get(id);
+    if (!row) { out.unparsed = p.slice(pos); break; }
+    const [, name, width, type, minRev = 1] = row;
+    const value = p.slice(pos + 2, pos + 2 + width);
+    if (value.length < width) {
+      throw new ProtocolError(`MID ${mid}: parameter ${id} truncated at offset ${pos}`, mid);
+    }
+    out[name] = convertField(value, type);
+    lastId    = Number(id);
+    maxRev    = Math.max(maxRev, minRev);
+    pos      += 2 + width;
+  }
+
+  return { fields: out, maxRev };
+}
+
+/**
+ * Parse a tagged MID whose rev 1 and rev 2+ layouts number their parameters
+ * differently. With the header revision unknown, the data is accepted as rev 1
+ * only if it is exactly the complete rev 1 parameter set.
+ */
+function parseTaggedByRevision(mid, p, rev, rev1Table, revNTable) {
+  if (rev === 1) return { fields: parseTagged(mid, p, rev1Table).fields, revision: 1 };
+  if (rev >= 2)  return { fields: parseTagged(mid, p, revNTable).fields, revision: rev };
+
+  try {
+    const { fields } = parseTagged(mid, p, rev1Table);
+    if (!fields.unparsed && Object.keys(fields).length === rev1Table.length) {
+      return { fields, revision: 1 };
+    }
+  } catch (_) { /* not rev 1 */ }
+
+  const { fields, maxRev } = parseTagged(mid, p, revNTable);
+  return { fields, revision: Math.max(2, maxRev) };
+}
+
+function parsePositional(mid, p, table) {
+  const out = {};
+  let pos   = 0;
+  for (const [name, width, type] of table) {
+    const value = p.slice(pos, pos + width);
+    if (value.length < width) {
+      throw new ProtocolError(`MID ${mid}: field ${name} truncated at offset ${pos}`, mid);
+    }
+    out[name] = convertField(value, type);
+    pos += width;
+  }
+  return out;
+}
+
+/* =========================================================
    State Factory
    ========================================================= */
 
@@ -211,7 +475,8 @@ function createInitialState() {
       direction:          '—',
       processOn:          false,
       spindleCount:       1,
-      spindleCountSource: 'default'
+      spindleCountSource: 'default',
+      data:               null      // last MID 0041 tool data reply
     },
 
     product: {
@@ -241,12 +506,8 @@ function createInitialState() {
     tightening: {
       inProgress:      false,
       cycleStartTs:    null,
-      // KEY: tighteningId (string) → result object.
-      // Rev 1 & Rev 4 do not carry an explicit spindle number field.
-      // Using tighteningId as the key is the only reliable way to de-duplicate
-      // results from multi-spindle heads at Rev 1.
-      // At Rev 2+, results carry an explicit spindle number; the key remains
-      // tighteningId for consistency and to avoid duplicate-spindle collisions.
+      // KEY: tighteningId (string) → result object. MID 0061 carries no
+      // spindle number at any revision, so tighteningId is the unique key.
       pendingSpindles: new Map(),
       watchdog:        null
     },
@@ -575,20 +836,10 @@ class OpenProtocolNutrunner extends EventEmitter {
       case 21:
         return { batchCounter: Number(p.slice(0, 4)) };
 
-      case 41: {
-        const bit = (i) => p.length > i && p[i] === '1';
-        const dir = p.length > 4 ? p[4] : null;
-        return {
-          controllerReady: bit(0),
-          toolReady:       bit(1),
-          toolEnabled:     bit(2),
-          toolRunning:     bit(3),
-          direction:       dir === '1' ? 'REVERSE' : dir === '0' ? 'FORWARD' : '—',
-          processOn:       bit(5),
-          alarmActive:     bit(6),
-          emergencyStop:   bit(7)
-        };
-      }
+      // MID 0041: Tool data upload reply (answer to MID 0040). Tagged tool
+      // identity and service data; it carries no ready/running status.
+      case 41:
+        return parseTagged(41, p, MID0041_FIELDS).fields;
 
       case 51: return { vin: p.trim() };
       case 52: return { vinRequired: true };
@@ -601,8 +852,8 @@ class OpenProtocolNutrunner extends EventEmitter {
           batchCounter: Number(p.slice(8, 12))
         };
 
-      case 61:  return this._parse0061(p);
-      case 65:  return this._parse0065(p);
+      case 61:  return this._parse0061(p, rev);
+      case 65:  return this._parse0065(p, rev);
 
       case 70:
       case 71:
@@ -640,112 +891,44 @@ class OpenProtocolNutrunner extends EventEmitter {
     }
   }
 
-  _parse0061(p) {
-    const rev = this._rxRevision || this.state.protocol.revision;
-
-    if (this.profile.isSimulator) {
-      // Simulator profile: tagged field layout with 2-byte field IDs before each value.
-      // Angles are whole integers per OP Spec Rev 1 (no scaling).
-      return {
-        cellId:         Number(p.slice(2, 6)),
-        channelId:      Number(p.slice(8, 10)),
-        controllerName: p.slice(12, 37).trim(),
-        vin:            p.slice(39, 64).trim(),
-        jobId:          Number(p.slice(66, 68)),
-        paramSetId:     Number(p.slice(70, 73)),
-        batchSize:      Number(p.slice(75, 79)),
-        batchCounter:   Number(p.slice(81, 85)),
-        ok:             p[87] === '1',
-        torqueStatus:   p[90],
-        angleStatus:    p[93],
-        torqueMin:      Number(p.slice(96,  102)) / 100,
-        torqueMax:      Number(p.slice(104, 110)) / 100,
-        torqueTarget:   Number(p.slice(112, 118)) / 100,
-        torque:         Number(p.slice(120, 126)) / 100,
-        angleMin:       Number(p.slice(128, 133)),
-        angleMax:       Number(p.slice(135, 140)),
-        angleTarget:    Number(p.slice(142, 147)),
-        angle:          Number(p.slice(149, 154)),
-        timestamp:      p.slice(156, 175),
-        lastPsetChange: p.slice(177, 196),
-        batchStatus:    p[198],
-        tighteningId:   p.slice(201, 211),
-        spindle:        1
-      };
+  /**
+   * MID 0061: Last tightening result data.
+   * The layout is selected by the header revision:
+   *   1     tagged, parameters 01-23
+   *   2-7   tagged, parameters 01-46, plus 47-49 (rev 3), 50-52 (rev 4),
+   *         53 (rev 5), 54-55 (rev 6), 56-57 (rev 7)
+   *   999   untagged "light" layout
+   * MID 0061 carries no spindle number at any revision; per-spindle results
+   * are MID 0101. When the header revision is unknown, rev 1 vs rev 2+ is
+   * inferred from the data.
+   *
+   * Never throws: a malformed result is returned as { parseError, raw } so the
+   * caller can still send the MID 0062 the controller waits for.
+   */
+  _parse0061(p, rev) {
+    try {
+      const { fields, revision } = rev === 999
+        ? { fields: parsePositional(61, p, MID0061_REV999_FIELDS), revision: 999 }
+        : parseTaggedByRevision(61, p, rev, MID0061_REV1_FIELDS, MID0061_REV2_FIELDS);
+      return this._normalizeResult(fields, revision);
+    } catch (err) {
+      return { parseError: err.message, raw: p, revision: rev ?? null };
     }
-
-    // ── Standard Open Protocol positional layout ────────────────────────────
-    //
-    // Rev 1 & Rev 4 share the same field layout. Rev 1 does NOT carry an
-    // explicit spindle number — the spindle field is hardcoded to 1 here.
-    // For genuine multi-spindle real hardware, subscribe at Rev 2+ so the
-    // controller sends an explicit spindle number per result.
-    //
-    if (rev === 1 || rev === 4) {
-      return {
-        cellId:         Number(p.slice(0, 4)),
-        channelId:      Number(p.slice(4, 6)),
-        controllerName: p.slice(6, 31).trim(),
-        vin:            p.slice(31, 56).trim(),
-        jobId:          Number(p.slice(56, 60)),
-        paramSetId:     Number(p.slice(60, 63)),
-        batchSize:      Number(p.slice(63, 67)),
-        batchCounter:   Number(p.slice(67, 71)),
-        ok:             p[71] === '1',
-        torqueStatus:   p[72],
-        angleStatus:    p[73],
-        torqueMin:      Number(p.slice(74, 80))  / 100,
-        torqueMax:      Number(p.slice(80, 86))  / 100,
-        torqueTarget:   Number(p.slice(86, 92))  / 100,
-        torque:         Number(p.slice(92, 98))  / 100,
-        angleMin:       Number(p.slice(98,  103)),
-        angleMax:       Number(p.slice(103, 108)),
-        angleTarget:    Number(p.slice(108, 113)),
-        angle:          Number(p.slice(113, 118)),
-        timestamp:      p.slice(118, 137),
-        lastPsetChange: p.slice(137, 156),
-        batchStatus:    p[156],
-        tighteningId:   p.slice(157, 167),
-        spindle:        1   // Rev 1/4: no spindle field; use tighteningId as Map key
-      };
-    }
-
-    // Rev 2 & 3 fallback (compact layout)
-    const torqueStatus = p.charAt(42) || '0';
-    const angleStatus  = p.charAt(43) || '0';
-    const batchStatus  = p.charAt(49) || '0';
-    return {
-      tighteningId: p.slice(0, 10),
-      spindle:      Number(p.slice(10, 12)) || 1,
-      torque:       Number(p.slice(12, 18)) / 100,
-      angle:        Number(p.slice(18, 24)),
-      torqueMin:    Number(p.slice(24, 30)) / 100,
-      torqueMax:    Number(p.slice(30, 36)) / 100,
-      torqueFinal:  Number(p.slice(36, 42)) / 100,
-      torqueStatus,
-      angleStatus,
-      timestamp:    p.slice(44, 63),
-      ok:           torqueStatus === '1' && angleStatus === '1',
-      batchStatus,
-      vin:          p.slice(63, 88).trim(),
-      jobId:        Number(p.slice(88, 92)),
-      paramSetId:   Number(p.slice(92, 95))
-    };
   }
 
-  _parse0065(p) {
-    const torqueStatus = p.charAt(24) || '0';
-    const angleStatus  = p.charAt(25) || '0';
-    return {
-      tighteningId: p.slice(0, 10),
-      spindle:      Number(p.slice(10, 12)) || 1,
-      torque:       Number(p.slice(12, 18)) / 100,
-      angle:        Number(p.slice(18, 24)),
-      torqueStatus,
-      angleStatus,
-      ok:           torqueStatus === '1' && angleStatus === '1',
-      timestamp:    p.slice(26, 45)
-    };
+  // MID 0065: Old tightening result upload reply (answer to MID 0064).
+  _parse0065(p, rev) {
+    const { fields, revision } =
+      parseTaggedByRevision(65, p, rev, MID0065_REV1_FIELDS, MID0065_REV2_FIELDS);
+    return this._normalizeResult(fields, revision);
+  }
+
+  _normalizeResult(fields, revision) {
+    const d = { revision, ...fields };
+    d.ok = fields.tighteningStatus === '1';
+    if (fields.torqueUnit !== undefined) d.torqueUnitName = TORQUE_UNITS[fields.torqueUnit] || null;
+    d.spindle = 1;   // MID 0061/0065 carry no spindle number
+    return d;
   }
 
   _parseAlarmList(str) {
@@ -770,6 +953,7 @@ class OpenProtocolNutrunner extends EventEmitter {
       case 3:
         this.state.protocol.revision         = d.revision;
         this.state.connection.linkLayerReady = true;
+        this.state.controller.ready          = true;
         this.emit('linkEstablished', { revision: d.revision });
         this.subscribeTighteningResults();
         if (this.profile.supportsAlarms) this.subscribeAlarms();
@@ -811,6 +995,9 @@ class OpenProtocolNutrunner extends EventEmitter {
           this._pendingVin = null;
         }
 
+        if (d.acceptedMid === this.profile.toolEnableMid)  this.state.tool.enabled = true;
+        if (d.acceptedMid === this.profile.toolDisableMid) this.state.tool.enabled = false;
+
         if (d.acceptedMid === 60) {
           this.state.protocol.revision = this._pendingRevision;
           this.emit('revisionNegotiated', { revision: this._pendingRevision });
@@ -832,32 +1019,13 @@ class OpenProtocolNutrunner extends EventEmitter {
         this.state.batch.counter = d.batchCounter;
         break;
 
-      case 41: {
-        const prevRunning   = this.state.tool.running;
-        const prevDirection = this.state.tool.direction;
-        const prevEmergency = this.state.controller.emergencyStop;
-
-        this.state.controller.ready         = d.controllerReady;
-        this.state.controller.errorActive   = d.alarmActive;
-        this.state.controller.emergencyStop = d.emergencyStop;
-        this.state.tool.ready               = d.toolReady;
-        this.state.tool.enabled             = d.toolEnabled;
-        this.state.tool.running             = d.toolRunning;
-        this.state.tool.direction           = d.direction;
-        this.state.tool.processOn           = d.processOn;
-
-        if (d.direction !== prevDirection && d.direction !== '—')
-          this.emit('directionChanged', { direction: d.direction });
-
-        if (d.emergencyStop && !prevEmergency)
-          this.emit('emergencyStop', { active: true });
-        else if (!d.emergencyStop && prevEmergency)
-          this.emit('emergencyStop', { active: false });
-
-        if (d.toolRunning && !prevRunning && !this.state.tightening.inProgress)
-          this._startTighteningCycle();
+      // MID 0041 is the reply to a MID 0040 tool data request. It holds tool
+      // identity and service counters, not tool/controller status.
+      case 41:
+        this.state.tool.data = d;
+        this.emit('toolData', d);
+        this._resolvePendingCommand(40, true, d);
         break;
-      }
 
       case 51:
         this.state.product.vin      = d.vin;
@@ -891,24 +1059,23 @@ class OpenProtocolNutrunner extends EventEmitter {
         this.emit('batchStarted', this.state.batch);
         break;
 
-      // FIX: MID 0061 and MID 0065 require DIFFERENT ACK MIDs.
-      // MID 0061 → ACK with MID 0062
-      // MID 0065 → ACK with MID 0066
-      // Sending MID 0062 for MID 0065 is a protocol violation on real hardware.
+      // MID 0061: the controller holds the next result until it receives a
+      // MID 0062 for this one, so acknowledge every result immediately and
+      // before any processing that could fail.
       case 61:
-        try {
-          this._handleTighteningResult(d, 61);
-        } catch (err) {
-          this.emit('parseError', { mid: 61, error: err.message });
+        this.sendMID(62);
+        if (d.parseError) {
+          this.emit('parseError', { mid: 61, error: d.parseError, raw: d.raw });
+          break;
         }
+        this._handleTighteningResult(d);
         break;
 
+      // MID 0065 is the reply to a MID 0064 old-result request. It is not part
+      // of the live result stream and takes no acknowledgement.
       case 65:
-        try {
-          this._handleTighteningResult(d, 65);
-        } catch (err) {
-          this.emit('parseError', { mid: 65, error: err.message });
-        }
+        this.emit('oldTighteningResult', d);
+        this._resolvePendingCommand(64, true, d);
         break;
 
       case 70:
@@ -998,11 +1165,9 @@ class OpenProtocolNutrunner extends EventEmitter {
     });
   }
 
-  _handleTighteningResult(d, sourceMid) {
+  _handleTighteningResult(d) {
     if (!this.state.tightening.inProgress || this.state.tightening.cycleStartTs === null) {
-      this.state.tightening.pendingSpindles.clear();
-      this.state.tightening.inProgress   = true;
-      this.state.tightening.cycleStartTs = Date.now();
+      this._startTighteningCycle();
     }
 
     if (d.vin && d.vin.length > 0) {
@@ -1015,26 +1180,15 @@ class OpenProtocolNutrunner extends EventEmitter {
       this.emit('vinLocked', this.state.product.vin);
     }
 
-    // FIX: Use tighteningId as the Map key (not spindle number).
-    // Rev 1 & Rev 4 hardcode spindle=1, so using spindle as key would cause
-    // every result to overwrite the same map entry — the cycle would never
-    // complete for multi-spindle heads. tighteningId is unique per result.
+    // MID 0061 carries no spindle number, so results are keyed by
+    // tighteningId, which is unique per result.
     const key = d.tighteningId || String(d.spindle);
-
-    if (
-      this.state.tool.spindleCountSource === 'default' &&
-      d.spindle > this.state.tool.spindleCount
-    ) {
-      this.state.tool.spindleCount       = d.spindle;
-      this.state.tool.spindleCountSource = 'mid061';
-      this.emit('spindleCountUpdated', { count: d.spindle, source: 'mid061' });
-    }
 
     this.emit('spindleResult', d);
     this.state.tightening.pendingSpindles.set(key, d);
 
     if (this.state.tightening.pendingSpindles.size < this.state.tool.spindleCount) {
-      // Not all spindles received yet — withhold ACK and batch completion.
+      // Not all spindles received yet — withhold batch completion.
       return;
     }
 
@@ -1046,13 +1200,6 @@ class OpenProtocolNutrunner extends EventEmitter {
 
     this.state.tightening.pendingSpindles.clear();
     this.state.tightening.inProgress = false;
-
-    // FIX: Send the correct ACK only ONCE per cycle (after all spindles arrive),
-    // not once per individual spindle result. This prevents ACK flooding on
-    // strict multi-spindle controllers (e.g. Atlas Copco Power Focus).
-    // MID 0062 = ACK for MID 0061
-    // MID 0066 = ACK for MID 0065
-    this.sendMID(sourceMid === 65 ? 66 : 62);
 
     // batch.counter semantics: one unit = one completed tightening CYCLE
     // (all spindles finished). This matches the controller's own MID 0031
@@ -1214,6 +1361,29 @@ class OpenProtocolNutrunner extends EventEmitter {
   // MID 0128: Job Batch Increment — skip a NOK bolt in strict batching mode
   skipBolt() {
     return this.sendMID(128, '', true);
+  }
+
+  /* =======================================================
+     Public API — Data Requests
+     ======================================================= */
+
+  // MID 0040 → MID 0041 tool data reply (resolves with the parsed data,
+  // also emitted as 'toolData'). A MID 0004 rejects the promise.
+  requestToolData() {
+    return this.sendMID(40, '', true).then(() => this.state.tool.data);
+  }
+
+  // MID 0064 → MID 0065 old tightening result reply ('oldTighteningResult').
+  // tighteningId 0 requests the most recent result.
+  requestOldTighteningResult(tighteningId = 0) {
+    const id = tighteningId.toString().padStart(10, '0');
+    if (id.length > 10) throw new Error('Tightening ID exceeds 10 digits');
+    let result = null;
+    const capture = d => { result = d; };
+    this.once('oldTighteningResult', capture);
+    return this.sendMID(64, id, true)
+      .then(() => result)
+      .finally(() => this.removeListener('oldTighteningResult', capture));
   }
 
   /* =======================================================
