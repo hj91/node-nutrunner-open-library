@@ -2,6 +2,20 @@
 
 ---
 
+## [Unreleased] - Framing Fix
+
+### Fixed
+- **TX header size (regressed in 1.2.7):** The header is 20 bytes *including* the 4-byte length field (Open Protocol §2.2.2). The spare is SeqNo(2) + NoOfParts(1) + PartNo(1) = 4 bytes. The 1.2.7 8-space spare pushed 4 stray spaces into the data field of every frame (MID 0001 went out as `0024…`).
+- **RX minimum frame size (regressed in 1.2.7):** `MIN_FRAME_SIZE` is 20. Data-less frames such as the MID 9999 keep-alive echo and MID 0062 were rejected, and the resync could swallow the next frame (e.g. the MID 0005 for MID 0060).
+- **Revision in the header:** `sendMID(mid, data, expectAck, revision)` writes the requested revision into the header Rev field. `subscribeTighteningResults(rev)` no longer sends the revision as MID 0060 data.
+- **Incoming header revision honoured:** the RX parser reads each frame's header (`parseHeader`), and MID parsers use the revision the controller actually sent instead of the requested one.
+- **Byte-oriented RX buffer:** frames are buffered as bytes and decoded as latin1, so the Length field matches byte counts and non-ASCII data no longer desyncs framing.
+
+### Added
+- Mock-controller test suite (`npm test`, `node:test`, no dependencies).
+
+---
+
 ## [1.2.7] - Real Hardware Multi-Spindle Fix - 2026-05-16
 
 ### Fixed

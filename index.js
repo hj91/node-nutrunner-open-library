@@ -19,6 +19,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Unreleased (Framing Fix):
+ * • BUGFIX: TX header is 20 bytes again (spare = SeqNo/NoOfParts/PartNo, 4
+ *   bytes). The v1.2.7 8-space spare put 4 stray bytes in every data field.
+ * • BUGFIX: MIN_FRAME_SIZE = 20. Length includes the 4-byte length field, so
+ *   data-less frames (MID 9999 echo, 0062, ...) are 20 bytes and valid.
+ * • BUGFIX: MID revision goes in the header Rev field (sendMID 4th argument);
+ *   MID 0060 no longer sends the revision as data.
+ * • BUGFIX: RX parsers follow each frame's own header revision.
+ * • BUGFIX: RX buffer is byte-oriented (latin1), so Length matches bytes.
+ *
  * Changelog v1.2.7 (Real Hardware Multi-Spindle Fix):
  * • BUGFIX: sendMID spare field corrected to 8 spaces (was 4) — TX frames now
  *   correctly emit 20-byte header bodies per Open Protocol spec. This resolves
@@ -98,9 +108,12 @@ const RECONNECT_BACKOFF_FACTOR   = 2;
 const COMMAND_TIMEOUT_MS         = 5000;
 const FRAME_VALIDATION_ENABLED   = true;
 
-// Open Protocol minimum frame size:
-// 4 bytes (length field) + 20 bytes (minimum header body) = 24 total.
-const MIN_FRAME_SIZE = 24;
+// Open Protocol header (spec §2.2.2) is 20 bytes INCLUDING the length field:
+// Length(4) MID(4) Rev(3) NoAck(1) StationID(2) SpindleID(2) SeqNo(2)
+// NoOfParts(1) PartNo(1). Length counts header + data, excluding the NUL.
+// A data-less frame (MID 9999 echo, MID 0062, ...) is exactly 20 bytes.
+const HEADER_SIZE    = 20;
+const MIN_FRAME_SIZE = HEADER_SIZE;
 
 /* =========================================================
    Brand Profiles
@@ -243,6 +256,28 @@ function createInitialState() {
 }
 
 /* =========================================================
+   Header
+   ========================================================= */
+
+// Parses the 20-byte Open Protocol header of a frame (latin1 string, length
+// field included). Blank, 000 and 001 revisions all mean revision 1.
+function parseHeader(frame) {
+  const field = (from, to) => frame.slice(from, to).trim();
+  const num   = (from, to) => { const n = parseInt(field(from, to), 10); return isNaN(n) ? null : n; };
+  return {
+    length:    num(0, 4),
+    mid:       num(4, 8),
+    revision:  num(8, 11) || 1,
+    noAck:     frame[11] === '1',
+    stationId: num(12, 14),
+    spindleId: num(14, 16),
+    seqNo:     num(16, 18),
+    parts:     num(18, 19),
+    partNo:    num(19, 20)
+  };
+}
+
+/* =========================================================
    Client
    ========================================================= */
 
@@ -280,7 +315,7 @@ class OpenProtocolNutrunner extends EventEmitter {
     this._pendingRevision = this.profile.maxRevision;
 
     this.socket         = null;
-    this.buffer         = '';
+    this.buffer         = Buffer.alloc(0);
     this.state          = createInitialState();
     this.lastTrafficTs  = Date.now();
     this.heartbeatTimer = null;
@@ -340,7 +375,7 @@ class OpenProtocolNutrunner extends EventEmitter {
 
     this.state.connection.connected      = false;
     this.state.connection.linkLayerReady = false;
-    this.buffer               = '';
+    this.buffer               = Buffer.alloc(0);
     this._pendingRevision     = this.profile.maxRevision;
 
     this.state.controller.ready         = false;
@@ -406,7 +441,9 @@ class OpenProtocolNutrunner extends EventEmitter {
      Framing
      ======================================================= */
 
-  sendMID(mid, payload = '', expectAck = false) {
+  // `revision` goes in the header Rev field: Open Protocol selects the MID
+  // revision there, never in the data field.
+  sendMID(mid, payload = '', expectAck = false, revision = 1) {
     this._touchTraffic();
 
     if (expectAck && !this.allowDuplicateCommands) {
@@ -417,17 +454,19 @@ class OpenProtocolNutrunner extends EventEmitter {
     }
 
     const midStr = mid.toString().padStart(4, '0');
-    const rev    = '001';
+    const rev    = revision.toString().padStart(3, '0');
     const noAck  = expectAck ? '0' : '1';
     const station = '01';
     const spindle = '01';
-    // FIX: spare must be 8 spaces so that the total header body = 20 bytes:
-    // MID(4) + rev(3) + noAck(1) + station(2) + spindle(2) + spare(8) = 20
-    const spare = '        ';
+    // SeqNo(2) + NoOfParts(1) + PartNo(1): blank = unused (no link-level ACK,
+    // single-part message).
+    const spare = '    ';
 
     const headerRest = `${rev}${noAck}${station}${spindle}${spare}`;
-    const body = `${midStr}${headerRest}${payload}`;
-    const len  = (body.length + 4).toString().padStart(4, '0');
+    const body  = `${midStr}${headerRest}${payload}`;
+    // Length counts bytes; frames are written as latin1 so 1 char = 1 byte.
+    const len   = (Buffer.byteLength(body, 'latin1') + 4).toString().padStart(4, '0');
+    const frame = Buffer.from(`${len}${body}\0`, 'latin1');
 
     if (expectAck) {
       const cmdId = ++this.commandSeq;
@@ -445,45 +484,58 @@ class OpenProtocolNutrunner extends EventEmitter {
 
       this.state.pendingCommands.set(cmdId, cmd);
       this._lastCommandId = cmdId;
-      this.socket.write(`${len}${body}\0`);
+      this.socket.write(frame);
       return promise;
     }
 
-    this.socket.write(`${len}${body}\0`);
+    this.socket.write(frame);
   }
 
   _onData(data) {
     this._touchTraffic();
-    this.buffer += data.toString().replace(/\0/g, '');
+    // Byte-oriented buffer: Length counts bytes, so a UTF-8 string would
+    // desync on any non-ASCII byte and corrupt binary payloads.
+    this.buffer = this.buffer.length ? Buffer.concat([this.buffer, data]) : data;
 
-    while (this.buffer.length >= 4) {
-      const lenStr = this.buffer.slice(0, 4);
+    for (;;) {
+      // Skip NUL terminators between frames.
+      let skip = 0;
+      while (skip < this.buffer.length && this.buffer[skip] === 0) skip++;
+      if (skip) this.buffer = this.buffer.subarray(skip);
+
+      if (this.buffer.length < 4) return;
+
+      const lenStr = this.buffer.toString('latin1', 0, 4);
 
       if (this.validateFrames && !/^\d{4}$/.test(lenStr)) {
-        this.emit('frameError', { type: 'invalid_length', buffer: this.buffer.slice(0, 20) });
-        this.buffer = this.buffer.slice(1);
+        this.emit('frameError', { type: 'invalid_length', buffer: this.buffer.toString('latin1', 0, 20) });
+        this.buffer = this.buffer.subarray(1);
         continue;
       }
 
       const len = parseInt(lenStr, 10);
 
-      // FIX: `len` is the TOTAL frame size including the 4-byte length prefix.
-      // Open Protocol minimum = 4 (length) + 20 (header body) = 24 total.
+      // `len` is the TOTAL frame size: 20-byte header (length field included)
+      // plus data, excluding the NUL terminator.
       if (this.validateFrames && (len < MIN_FRAME_SIZE || len > 9999)) {
         this.emit('frameError', { type: 'length_out_of_range', length: len });
-        this.buffer = this.buffer.slice(1);
+        this.buffer = this.buffer.subarray(1);
         continue;
       }
 
+      // Unvalidated garbage can't be framed at all; drop a byte to make progress.
+      if (!(len >= 4)) { this.buffer = this.buffer.subarray(1); continue; }
+
       if (this.buffer.length < len) return;
 
-      const frame   = this.buffer.slice(4, len);
-      this.buffer   = this.buffer.slice(len);
-      const mid     = parseInt(frame.slice(0, 4), 10);
-      const payload = frame.slice(16);
+      const frame  = this.buffer.toString('latin1', 0, len);
+      this.buffer  = this.buffer.subarray(len);
+      const header = parseHeader(frame);
+      const mid    = header.mid;
+      const payload = frame.slice(HEADER_SIZE);
 
       try {
-        const parsed = this._parseMID(mid, payload);
+        const parsed = this._parseMID(mid, payload, header);
         this._handleMID(mid, parsed);
       } catch (err) {
         this.emit('parseError', { mid, error: err.message });
@@ -495,7 +547,10 @@ class OpenProtocolNutrunner extends EventEmitter {
      MID Parsers
      ======================================================= */
 
-  _parseMID(mid, p) {
+  // `header.revision` is the revision the controller actually sent this
+  // frame at; layouts must follow it, not the revision that was requested.
+  _parseMID(mid, p, header = null) {
+    this._rxRevision = header ? header.revision : null;
     switch (mid) {
 
       case 2:
@@ -586,7 +641,7 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   _parse0061(p) {
-    const rev = this.state.protocol.revision;
+    const rev = this._rxRevision || this.state.protocol.revision;
 
     if (this.profile.isSimulator) {
       // Simulator profile: tagged field layout with 2-byte field IDs before each value.
@@ -1071,7 +1126,7 @@ class OpenProtocolNutrunner extends EventEmitter {
   subscribeTighteningResults(revision = null) {
     const rev = revision !== null ? revision : this.profile.maxRevision;
     this._pendingRevision = rev;
-    this.sendMID(60, String(rev).padStart(3, '0'), true).catch(() => {});
+    this.sendMID(60, '', true, rev).catch(() => {});
     this.state.protocol.subscriptions.tighteningResults = true;
   }
 
