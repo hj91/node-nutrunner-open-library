@@ -234,13 +234,60 @@ test('rev 5-7 fields', () => {
   assert.equal(d.unparsed, undefined);
 });
 
+// Rev 8 adds 58-61, rev 9 adds 62-64, rev 10 adds 65-74 (spec Tables 105-107).
+const REV10 = REV7 +
+  '58' + '000300' +                  // start final angle (torque 3.00)
+  '59' + '1' +                       // post view torque activated
+  '60' + '002000' +                  // post view torque high
+  '61' + '000500' +                  // post view torque low
+  '62' + '01250' +                   // current monitoring amp 12.50 A
+  '63' + '     ' +                   // amp min not used (blank)
+  '64' + '02000' +                   // amp max 20.00 A
+  '65' + '00001' +                   // angle numerator scale factor
+  '66' + '00001' +                   // angle denominator scale factor
+  '67' + '1' +                       // overall angle status OK
+  '68' + '00010' +                   // overall angle min
+  '69' + '00900' +                   // overall angle max
+  '70' + '00450' +                   // overall angle
+  '71' + '001610' +                  // peak torque 16.10
+  '72' + '000000' +                  // residual breakaway torque
+  '73' + '000100' +                  // start rundown angle (torque 1.00)
+  '74' + '001400';                   // rundown angle complete (torque 14.00)
+
+test('rev 8-10 fields', () => {
+  const { client } = createClient();
+  const d = client._parseMID(61, REV10, 10);
+
+  assert.equal(d.revision, 10);
+  assert.equal(d.startFinalAngle, 3);
+  assert.equal(d.postViewTorqueActivated, '1');
+  assert.equal(d.postViewTorqueHigh, 20);
+  assert.equal(d.currentMonitoringAmp, 12.5);
+  assert.equal(d.currentMonitoringAmpMin, null, 'blank = not supported');
+  assert.equal(d.overallAngle, 450);
+  assert.equal(d.peakTorque, 16.1);
+  assert.equal(d.rundownAngleComplete, 14);
+  assert.equal(d.unparsed, undefined);
+});
+
+test('rev 998 adds multistage stage results', () => {
+  const { client } = createClient();
+  const rev6 = REV7.slice(0, REV7.indexOf('56' + '0004512'));
+  const data = rev6 + '56' + '02' + '57' + '02' + '58' + '001200' + '00045' + '001500' + '00030';
+  const d = client._parseMID(61, data, 998);
+
+  assert.equal(d.revision, 998);
+  assert.equal(d.numberOfStages, 2);
+  assert.deepEqual(d.stageResults, [{ torque: 12, angle: 45 }, { torque: 15, angle: 30 }]);
+});
+
 test('parameters newer than the implemented table are kept as unparsed', () => {
   const { client } = createClient();
-  const extra = '58' + '02' + '59' + '0012345';
-  const d = client._parseMID(61, REV7 + extra, 8);
+  const extra = '75' + '0012345';
+  const d = client._parseMID(61, REV10 + extra, 11);
 
-  assert.equal(d.revision, 8);
-  assert.equal(d.finalAngleDecimal, 62.75);
+  assert.equal(d.revision, 11);
+  assert.equal(d.rundownAngleComplete, 14);
   assert.equal(d.unparsed, extra);
 });
 

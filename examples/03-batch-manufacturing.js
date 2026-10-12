@@ -11,13 +11,13 @@ const nutrunner = new OpenProtocolNutrunner({
 });
 
 nutrunner.on('batchStarted', (b) =>
-  console.log(`📦 Batch ${b.batchId} started  (size: ${b.size})`));
+  console.log(`📦 Batch for pset ${b.batchId} started  (size: ${b.size})`));
 
 nutrunner.on('batchProgress', ({ counter, size, remaining }) =>
   console.log(`  Progress: ${counter}/${size}  —  ${remaining} remaining`));
 
 nutrunner.on('batchCompleted', (b) =>
-  console.log(`✓ Batch ${b.batchId} complete`));
+  console.log(`✓ Batch for pset ${b.batchId} complete`));
 
 nutrunner.on('tighteningCycleCompleted', ({ results, overallOk }) => {
   results.forEach(r => {
