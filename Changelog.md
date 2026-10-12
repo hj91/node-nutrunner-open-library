@@ -2,6 +2,34 @@
 
 ---
 
+## [Unreleased] - Open Protocol R2.16.0 Compliance
+
+Checked field by field against *Open Protocol Specification R2.16.0* (Atlas Copco 9836 4415 01).
+
+### Fixed
+- **One outstanding message (§3.2.1):** requests, commands and subscriptions are queued and sent one at a time; each waits for its MID 0005, reply MID or MID 0004.
+- **Every subscription push is acknowledged (Table 7):** MID 0015→0016, 0022→0023, 0035→0036, 0052→0053, 0071→0072, 0074→0075, 0076→0077, 0091→0092, 0101→0102, 0211→0212, 0217→0218, 0221→0222, 0401→0402, 0421→0422, and the other subscription data MIDs; generic pushes (0900, 1201, 1202, ...) with MID 0005.
+- **MID 0002** is parsed as tagged controller info (revisions 1-7). **MID 0003** is integrator→controller, and is now sent by `disconnect()` (it was MID 0002).
+- **MID 0004** error code is 2 digits and mapped to the spec text.
+- **MID semantics:** 0011 (pset ID list), 0015 (pset selected), 0021/0022 (lock at batch done), 0031 (Job ID list), 0035 (tagged Job info), 0051/0052 (VIN subscribe / VIN), 0071 (tagged alarm, 4/5-character code), 0074, 0076 (single tagged status), 0091 and 0101 (tagged, per-spindle records).
+- **Command layouts:** MID 0019 batch size is 2 digits at rev 1 and 4 at rev 2; MID 0020 carries the pset ID; MID 0038/0039 Job ID is 2 digits at rev 1 and 4 at rev 2; MID 0050 VIN is sent unpadded; `decrementBatch()` sends MID 0129 (MID 0021 is "Lock at batch done subscribe").
+- **Job select is MID 0038 for every brand** (the `stanley` and `ingersoll-rand` profiles sent MID 0034, which is *Job info subscribe*).
+- **MID 0065 revisions 2+:** the table was missing Job ID (03) and batch size (07); revisions 3-10 added.
+- **Batch state** mirrors the batch size, counter and status in MID 0061 instead of a local counter seeded from MID 0031.
+- **Revision downgrade** for MID 0060 only on "revision unsupported" (MID 0004 codes 74, 76, 97), not on e.g. "subscription already exists".
+- **Response timeout (§3.3.5):** no answer to a command, keep-alive or link ACK within `commandTimeout` (default 10 s) drops the connection so `autoReconnect` can recover it.
+
+### Added
+- MID 0061 revisions 8-10 (parameters 58-74) and 998 (multistage stage results); blank numeric fields parse as `null`.
+- Link-level acknowledging (`linkLevelAck`): header sequence numbers with MID 9997/9998, retransmission detection, out-of-sequence rejection and resync (§2.2.5, §3.2.2).
+- Multi-part message reassembly (§2.2.6). MID 0001 revision negotiation (`communicationRevision`, steps down on error 97).
+- Requests: 0010/0011, 0012/0013, 0030/0031, 0032/0033, 0064 rev 10 (offline), 0080/0081, 0214/0215, 0410/0411, generic 0006.
+- Subscriptions: 0014-0017, 0021-0024, 0034-0037, 0051-0054, 0090-0093, 0100-0103 (rev 2-5 data), 0210-0213, 0216-0219, 0220-0223, 0400-0403, 0420-0423, generic 0008/0009.
+- Commands: 0039, 0042/0043 rev 2, 0044, 0045, 0046, 0047 (+0048), 0082, 0113, 0127, 0128, 0129 rev 2, 0130, 0200, 0224, 0225.
+- MID 0041 revisions 5-7.
+
+---
+
 ## [Unreleased] - Framing Fix
 
 ### Fixed
