@@ -14,7 +14,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-     "test": "echo \"No tests yet\" && exit 0",
+     "test": "node --test --test-timeout=5000",
      "start": "node examples/01-basic-tightening.js"
   },
   "repository": {
