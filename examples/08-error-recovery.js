@@ -22,7 +22,7 @@ nutrunner.on('reconnecting', ({ attempt, delay }) =>
   console.warn(`  Reconnect attempt #${attempt} in ${delay} ms...`));
 
 nutrunner.on('alarm', (alarm) => {
-  console.error(`🚨 ALARM [${alarm.alarmCode}]: ${alarm.message}`);
+  console.error(`🚨 ALARM [${alarm.alarmCode}] at ${alarm.timestamp}${alarm.alarmText ? ': ' + alarm.alarmText : ''}`);
   nutrunner.acknowledgeAlarm();
 });
 

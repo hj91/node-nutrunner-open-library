@@ -391,7 +391,7 @@ Result objects carry `revision` (the MID 0061 layout they were parsed with) plus
 | `batchCompleted` | batch object | MID 0061 reported batch status OK |
 | `lockAtBatchDone` | `{ relayStatus }` | MID 0022 |
 | `batchResetConfirmed` | — | Batch counter reset (MID 0020 ACK) |
-| `alarm` | `{ alarmCode, controllerReady, toolReady, timestamp, ... }` | MID 0071: an alarm appeared |
+| `alarm` | `{ alarmCode, controllerReady, toolReady, timestamp, toolHealth, alarmText }` | MID 0071: an alarm appeared (`toolHealth` and `alarmText` only at rev 3: `subscribeAlarms(3)`) |
 | `alarmAcknowledged` | `{ alarmCode }` | MID 0074: the alarm was acknowledged on the controller |
 | `alarmStatus` | `{ alarmActive, alarmCode, controllerReady, toolReady, timestamp }` | MID 0076: alarm status after subscribing |
 | `multiSpindleStatus` | status with `spindles[]` | MID 0091 |
