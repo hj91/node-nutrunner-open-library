@@ -141,10 +141,10 @@ for (const [mid, data, ack] of PUSHES) {
   });
 }
 
-test('generic subscription data (MID 1201) is acknowledged with MID 0005', () => {
+test('generic subscription data (MID 1900) is acknowledged with MID 0005', () => {
   const { client, writes } = createClient();
-  rx(client, frame(1201, 'x'));
-  assert.deepEqual(sent(writes).map(f => [f.mid, f.data]), [[5, '1201']]);
+  rx(client, frame(1900, '000'));
+  assert.deepEqual(sent(writes).map(f => [f.mid, f.data]), [[5, '1900']]);
 });
 
 test('request replies are not acknowledged', async () => {

@@ -8,7 +8,7 @@ Checked field by field against *Open Protocol Specification R2.16.0* (Atlas Copc
 
 ### Fixed
 - **One outstanding message (§3.2.1):** requests, commands and subscriptions are queued and sent one at a time; each waits for its MID 0005, reply MID or MID 0004.
-- **Every subscription push is acknowledged (Table 7):** MID 0015→0016, 0022→0023, 0035→0036, 0052→0053, 0071→0072, 0074→0075, 0076→0077, 0091→0092, 0101→0102, 0211→0212, 0217→0218, 0221→0222, 0401→0402, 0421→0422, and the other subscription data MIDs; generic pushes (0900, 1201, 1202, ...) with MID 0005.
+- **Every subscription push is acknowledged (Table 7):** MID 0015→0016, 0022→0023, 0035→0036, 0052→0053, 0071→0072, 0074→0075, 0076→0077, 0091→0092, 0101→0102, 0211→0212, 0217→0218, 0221→0222, 0401→0402, 0421→0422, and the other subscription data MIDs; MID 0106/0107→0108, 1201/1202→1203, 1601→1602; generic pushes (0700, 0900, 0901, 1900, 2501) with MID 0005.
 - **MID 0002** is parsed as tagged controller info (revisions 1-7). **MID 0003** is integrator→controller, and is now sent by `disconnect()` (it was MID 0002).
 - **MID 0004** error code is 2 digits and mapped to the spec text.
 - **MID semantics:** 0011 (pset ID list), 0015 (pset selected), 0021/0022 (lock at batch done), 0031 (Job ID list), 0035 (tagged Job info), 0051/0052 (VIN subscribe / VIN), 0071 (tagged alarm, 4/5-character code), 0074, 0076 (single tagged status), 0091 and 0101 (tagged, per-spindle records).
@@ -27,6 +27,16 @@ Checked field by field against *Open Protocol Specification R2.16.0* (Atlas Copc
 - Subscriptions: 0014-0017, 0021-0024, 0034-0037, 0051-0054, 0090-0093, 0100-0103 (rev 2-5 data), 0210-0213, 0216-0219, 0220-0223, 0400-0403, 0420-0423, generic 0008/0009.
 - Commands: 0039, 0042/0043 rev 2, 0044, 0045, 0046, 0047 (+0048), 0082, 0113, 0127, 0128, 0129 rev 2, 0130, 0200, 0224, 0225.
 - MID 0041 revisions 5-7.
+- Variable data fields (chapter 6): parsed into `fields[]` / `values`, encoded with `encodeVariableFields()`.
+- MID 0900/0901 trace curves and plot parameters (rev 1-3): binary samples, coefficient PID 02213/02214, resolutions; subscribe/unsubscribe/request helpers.
+- MID 1201/1202 operation results (rev 1-3 / 1-2), assembled into `operationResultComplete`; ACK MID 1203. MID 0067 result list.
+- PowerMACS MID 0105-0109 (rev 1-4): station and bolt results with step and special values; MID 0108 carries the `powerMacsBoltData` flag.
+- MID 1000/1001 alarm with variable data.
+- Identifiers: MID 0150, 0151-0154 (0152 parsed), 0155, 0156, 0157, 1601/1602.
+- Tightening programs MID 2500/2501 (rev 1-2 node trees with JSON), 2502/2503 password, 2504, 2505; modes 2600-2606.
+- Tools: 0700, 0701, 0702, 0703; tool tag 0260-0265; motor tuning 0500-0504.
+- Operator and job: 0110, 0111, job line control 0120-0126 and 0131-0133, dynamic Job 0140 (rev 1-4, 999).
+- PLC user data 0240-0245; selectors 0250-0255, 1900, 1901; histogram 0300/0301; controller 0270, 2100.
 
 ---
 

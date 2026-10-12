@@ -107,6 +107,7 @@ const nutrunner = new OpenProtocolNutrunner({
   communicationRevision: 1,      // MID 0001/0002 revision; steps down on MID 0004 error 97
   linkLevelAck:          false,  // MID 0001 rev 6+ with sequence numbers and MID 9997/9998
   commandTimeout:        10000,  // ms to wait for an answer before the link is considered lost
+  powerMacsBoltData:     true,   // MID 0108 "Bolt data": ask PowerMACS for the MID 0107 bolt results
 
   // ── Hardware ──────────────────────────────────────────────────────────────
   spindleCount:          null,   // Manual override for controllers without MID 101
@@ -334,6 +335,31 @@ main().catch(console.error);
 
 Result objects carry `revision` (the MID 0061 layout they were parsed with) plus the fields of that revision: rev 1 is tagged parameters 01-23, revs 2-10 are tagged parameters 01-74 (strategy, error status, rundown/current/self-tap/prevail values, pset name, torque unit, identifier parts, post-view torque, current in A, overall angle, peak torque, ...), rev 998 adds multistage stage results, rev 999 is the untagged light layout. Numeric fields the controller sends as spaces (not supported) are `null`. MID 0061 carries no spindle number, so `spindle` is always 1. Parameters newer than this library knows are returned in `unparsed`. A result that cannot be parsed is still acknowledged and reported through `parseError`.
 
+### Results, Traces and Identifiers
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `operationResult` | `{ resultDataId, ok, objects[], fields, values, ... }` | MID 1201 overall data |
+| `operationResultObject` | `{ objectId, fields, values, ... }` | MID 1202, one per object |
+| `operationResultComplete` | MID 1201 data plus `objectData[]` | The 1201 and all its 1202 messages arrived |
+| `trace` | `{ traceType, traceTypeName, samples[], values[], coefficient, resolutions[], ... }` | MID 0900. Samples are signed 16-bit big-endian (the spec does not state the byte order); `values` applies PID 02213/02214 |
+| `tracePlotParameters` | `{ fields, values, ... }` | MID 0901 |
+| `tighteningResultList` | `{ results: [{ index, startTime, ok }] }` | MID 0067 |
+| `powerMacsResult` / `powerMacsBoltResult` | station / bolt data with `bolts[]`, `stepResults[]`, `specialValues[]` | MID 0106 / MID 0107 |
+| `alarm` | `{ mid: 1000, alarmCode, alarmText, severity, fields, values }` | MID 1000 (same event as MID 0071) |
+| `identifierResultParts` | `{ parts: [{ identifierType, includedInWorkOrder, status, resultPart }] }` | MID 0152 |
+| `dynamicIdentifiers` | `{ formatType, fields, values }` | MID 1601 |
+| `tighteningProgram` | `{ program: { nodeType, parameters, children } }` | MID 2501 |
+| `programPasswordRequest` | — | MID 2502: answer with `sendProgramPassword()` |
+| `modeIds` / `modeData` | modes / bolts | MID 2601 / MID 2603 |
+| `toolList` / `toolGenericData` / `toolDataDownloadStatus` | tools / variable data | MID 0701 / 0702 / 0700 |
+| `toolTagId` | `{ toolTagId, toolTagIdDecoded }` | MID 0262 |
+| `motorTuningResult` | `{ motorTuneOk }` | MID 0501 |
+| `jobLineControl` | `{ event: 'started' \| 'alert1' \| 'alert2' \| 'done' }` | MID 0121-0124 |
+| `userData` | `{ userData, bytes }` | MID 0242 PLC user data (hex) |
+| `selectorSocketInfo` | `{ mid, deviceId, sockets[] }` or variable data | MID 0251 / MID 1900 |
+| `histogram` | `{ sigma, mean, classRange, bars[9] }` | MID 0301 |
+
 ### Command Events
 
 | Event | Payload | Description |
@@ -375,6 +401,7 @@ Result objects carry `revision` (the MID 0061 layout they were parsed with) plus
 | `automaticManualMode` | `{ mode }` | MID 0401 |
 | `commandsDisabled` | `{ commandsDisabled }` | MID 0421 |
 | `toolPairingStatus` | `{ pairingStatus, timestamp }` | MID 0048 |
+| `selectedMode` / `modeSelected` | `{ modeId, lastChange, numberOfBolts }` | MID 2604 |
 | `mid` | `{ mid, revision, data }` | Every received MID, parsed or `{ raw }` |
 | `spindleCountUpdated` | `{ count, source }` | Spindle count auto-detected from MID 0061 or 0101 |
 | `stateChanged` | full state snapshot | Emitted after every state mutation |
@@ -425,7 +452,8 @@ nutrunner.isReady()            // → boolean (connected + link ready + no alarm
 - Every subscription push is acknowledged with its spec ACK MID (0016, 0023, 0036, 0053, 0062, 0072, 0075, 0077, 0092, 0102, 0212, 0218, 0222, 0402, 0422, ...) before it is parsed.
 - With `linkLevelAck: true` the client starts with MID 0001 revision 6. If MID 0002 reports sequence-number support, messages carry header sequence numbers and are acknowledged with MID 9997/9998 instead (spec §3.2.2).
 - `communicationRevision` (default 1) is the MID 0001/0002 revision; it steps down automatically on MID 0004 error 97.
-- Multi-part (linked) messages are reassembled before parsing.
+- Multi-part (linked) messages are reassembled before parsing. Sending is limited to one part (9979 data bytes).
+- Variable data fields (spec chapter 6: PID, length, data type, unit, step, value) are parsed into `fields[]` and a `values` map keyed by PID (`'02001'`, or `'02001.3'` for step 3). `encodeVariableFields()` builds them for MIDs 0703, 1901, 2100, 2500 and 2505.
 - No answer within `commandTimeout` (default 10 s) to a command, keep-alive or link ACK drops the connection, and `autoReconnect` re-establishes it (spec §3.3.5).
 
 ### Commands (all return Promises — truly await the controller ACK)
@@ -453,6 +481,25 @@ await nutrunner.setRelays([0, 1, 2, 3])        // MID 0200 (0 off, 1 on, 2 flash
 await nutrunner.setDigitalInputFunction(fn)    // MID 0224 / resetDigitalInputFunction MID 0225
 await nutrunner.flashGreenLight()              // MID 0113
 await nutrunner.acknowledgeAlarm()             // MID 0078
+await nutrunner.downloadIdentifier(text)       // MID 0150 (max 100 chars)
+await nutrunner.bypassIdentifier()             // MID 0155 / resetLatestIdentifier 0156 / resetAllIdentifiers 0157
+await nutrunner.selectParameterSetDynamicJob(p)// MID 2504
+await nutrunner.selectParameterSetDynamically(p, fields) // MID 2505
+await nutrunner.selectMode(modeId)             // MID 2606
+await nutrunner.downloadTighteningProgram(tree, rev) // MID 2500; tree = { nodeType, parameters, children, json }
+nutrunner.sendProgramPassword(pw)              // MID 2503 answer to 'programPasswordRequest' (MID 2502)
+await nutrunner.setCalibrationValueGeneric(tool, fields) // MID 0703
+await nutrunner.sendExternalToolTag(hex8, 1)   // MID 0265
+await nutrunner.requestMotorTuning()           // MID 0504
+await nutrunner.displayUserTextCompact('OK')   // MID 0110
+await nutrunner.displayUserTextGraph(lines, { duration, acknowledge }) // MID 0111
+await nutrunner.setJobLineControlStart()       // MID 0131 / setJobLineAlert1 0132 / setJobLineAlert2 0133
+await nutrunner.executeDynamicJob(job, rev)    // MID 0140 (rev 1-4, 999)
+await nutrunner.userDataDownload(hex)          // MID 0240 / userDataDownloadWithOffset(offset, hex) MID 0245
+await nutrunner.setSelectorGreenLights(dev, cmds) // MID 0254 / setSelectorRedLights MID 0255
+await nutrunner.selectorSocketControl(fields)  // MID 1901
+await nutrunner.rebootController()             // MID 0270
+await nutrunner.deviceCommand(id, fields)      // MID 2100 (0001 reboot, 0002/0003 standby)
 ```
 
 ### Data Requests (resolve with the parsed reply)
@@ -467,6 +514,17 @@ await nutrunner.requestOldTighteningResult(tighteningId) // MID 0064 → MID 006
 await nutrunner.readTime()                               // MID 0080 → MID 0081
 await nutrunner.requestIoDeviceStatus(device)            // MID 0214 → MID 0215
 await nutrunner.requestAutoDisableSettings()             // MID 0410 → MID 0411
+await nutrunner.requestHistogram(paramSetId, type)       // MID 0300 → MID 0301
+await nutrunner.requestToolTagId()                       // MID 0260 → MID 0262
+await nutrunner.requestModeIds()                         // MID 2600 → MID 2601
+await nutrunner.requestModeData(modeId)                  // MID 2602 → MID 2603
+await nutrunner.requestOperationResult(index)            // MID 0006 → MID 1201 (+ MID 1202s)
+await nutrunner.requestTighteningResultList(start, n)    // MID 0006 → MID 0067
+await nutrunner.requestTrace(index, traceType, tool)     // MID 0006 → MID 0900
+await nutrunner.requestTracePlotParameters(index, type)  // MID 0006 → MID 0901
+await nutrunner.requestTighteningProgram(id, nodeType)   // MID 0006 → MID 2501
+await nutrunner.requestToolList()                        // MID 0006 → MID 0701
+await nutrunner.requestToolGenericData(toolNumber)       // MID 0006 → MID 0702
 await nutrunner.requestData(mid, revision, extraData)    // MID 0006 generic request → that MID
 ```
 
@@ -487,8 +545,26 @@ nutrunner.subscribeRelayFunction(fn)         // MID 0216 → 0217 (ACK 0218)
 nutrunner.subscribeDigitalInputFunction(fn)  // MID 0220 → 0221 (ACK 0222)
 nutrunner.subscribeAutomaticManualMode()     // MID 0400 → 0401 (ACK 0402)
 nutrunner.subscribeCommandsDisabled()        // MID 0420 → 0421 (ACK 0422)
-nutrunner.subscribe(mid, revision, extra)    // MID 0008 generic subscription (e.g. 0900, 1201)
-// each has a matching unsubscribe…() (MID 0063, 0073, 0017, 0024, 0037, 0054, 0093, 0103, 0213, 0219, 0223, 0403, 0423, 0009)
+nutrunner.subscribePowerMacsResults(4, { onlyNew: true }) // MID 0105 → 0106/0107 (ACK 0108)
+nutrunner.subscribeJobLineControl()          // MID 0120 → 0121-0124 (ACK 0125)
+nutrunner.subscribeIdentifierResultParts()   // MID 0151 → 0152 (ACK 0153)
+nutrunner.subscribeUserData()                // MID 0241 → 0242 (ACK 0243)
+nutrunner.subscribeSelectorSocketInfo()      // MID 0250 → 0251 (ACK 0252)
+nutrunner.subscribeToolTagId()               // MID 0261 → 0262 (ACK 0263)
+nutrunner.subscribeMotorTuning()             // MID 0500 → 0501 (ACK 0502)
+// MID 0008 subscriptions:
+nutrunner.subscribeOperationResults({ sendObjectData: true }) // → 1201 + 1202 (ACK 1203)
+nutrunner.subscribeTraces([1, 2])            // → 0900 trace curves (ACK 0005)
+nutrunner.subscribeTracePlotParameters()     // → 0901 (ACK 0005)
+nutrunner.subscribeAlarmsV2()                // → 1000 (ACK 1001)
+nutrunner.subscribeDynamicIdentifiers({ sendAlternative: 2, pids: [60] }) // → 1601 (ACK 1602)
+nutrunner.subscribeTighteningPrograms(id, nodeType) // → 2501 (ACK 0005)
+nutrunner.subscribeModeSelected()            // → 2604 (ACK 2605)
+nutrunner.subscribeToolDataDownloadStatus()  // → 0700 (ACK 0005)
+nutrunner.subscribeSelectorSocketInfoV2()    // → 1900 (ACK 0005)
+nutrunner.subscribe(mid, revision, extra)    // MID 0008 generic subscription
+// each has a matching unsubscribe…() (MID 0063, 0073, 0017, 0024, 0037, 0054, 0093, 0103, 0109, 0126,
+// 0154, 0213, 0219, 0223, 0244, 0253, 0264, 0403, 0423, 0503, 0009)
 ```
 
 ### Configuration & State

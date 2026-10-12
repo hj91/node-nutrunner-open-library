@@ -272,11 +272,14 @@ const PUSH_ACK = {
   15: 16, 22: 23, 35: 36, 52: 53, 61: 62, 71: 72, 74: 75, 76: 77, 91: 92,
   101: 102, 106: 108, 107: 108, 121: 125, 122: 125, 123: 125, 124: 125,
   152: 153, 211: 212, 217: 218, 221: 222, 242: 243, 251: 252, 262: 263,
-  401: 402, 421: 422, 501: 502, 1000: 1001, 2604: 2605, 8001: 8002
+  401: 402, 421: 422, 501: 502, 1000: 1001, 1201: 1203, 1202: 1203,
+  1601: 1602, 2604: 2605, 8001: 8002
 };
+// MID 0106/0107 are acknowledged with MID 0108, whose data says whether the
+// next bolt message is wanted (Table 156); see _ackPush.
 
 // Subscription data MIDs acknowledged with MID 0005 carrying the data MID.
-const PUSH_ACK_0005 = new Set([700, 900, 901, 1201, 1202, 1601, 1900]);
+const PUSH_ACK_0005 = new Set([700, 900, 901, 1900, 2501]);
 
 /* =========================================================
    MID Field Tables
@@ -834,6 +837,227 @@ function digits(value, width, name, min = 0) {
 function nextSeq(seq) { return seq >= 99 ? 1 : seq + 1; }
 
 /* =========================================================
+   Variable Data Fields (spec §2.4 / chapter 6)
+   =========================================================
+   Used by MIDs 0700, 0702, 0703, 0900, 0901, 1000, 1201, 1202, 1601, 1900,
+   1901, 2100, 2500, 2501 and 2505. One field is
+     PID(5) Length(3) DataType(2) Unit(3) StepNo(4) Value(Length)
+   and a section is a 3-digit count followed by that many fields.
+*/
+
+const DATA_TYPES = {
+  1: 'UI', 2: 'I', 3: 'F', 4: 'S', 5: 'T', 6: 'B', 7: 'H',
+  8: 'PL1', 9: 'PL2', 10: 'PL4', 50: 'FA', 51: 'UA', 52: 'IA'
+};
+
+// Array types send one value per 8 ASCII characters (Table 216).
+function splitArray(value, toValue) {
+  const out = [];
+  for (let i = 0; i < value.length; i += 8) out.push(toValue(value.slice(i, i + 8)));
+  return out;
+}
+
+function convertVariable(value, dataType) {
+  switch (dataType) {
+    case 1: case 2: return toNumber(value);
+    case 3:         return toNumber(value);
+    case 4:         return value.replace(/\s+$/, '');
+    case 6:         return value === '1';
+    case 8: case 9: case 10: case 50:
+      return splitArray(value, toNumber);
+    case 51: case 52:
+      return value.length % 8 === 0 ? splitArray(value, toNumber) : value.split('').map(Number);
+    default:        return value;     // T, H and unknown types stay as text
+  }
+}
+
+// Parse `count` variable data fields starting at `pos`.
+function parseVariableFields(mid, p, pos, count) {
+  const fields = [];
+  for (let i = 0; i < count; i++) {
+    const head = p.slice(pos, pos + 17);
+    if (head.length < 17 || !/^\d{5}\d{3}\d{2}\d{3}\d{4}$/.test(head)) {
+      throw new ProtocolError(`MID ${mid}: invalid variable data field at offset ${pos}`, mid);
+    }
+    const length   = Number(head.slice(5, 8));
+    const dataType = Number(head.slice(8, 10));
+    const raw      = p.slice(pos + 17, pos + 17 + length);
+    if (raw.length < length) {
+      throw new ProtocolError(`MID ${mid}: variable data field ${head.slice(0, 5)} truncated`, mid);
+    }
+    fields.push({
+      pid:      head.slice(0, 5),
+      length,
+      dataType,
+      dataTypeName: DATA_TYPES[dataType] || null,
+      unit:     Number(head.slice(10, 13)),
+      step:     Number(head.slice(13, 17)),
+      value:    convertVariable(raw, dataType),
+      raw
+    });
+    pos += 17 + length;
+  }
+  return { fields, pos };
+}
+
+// A 3-digit count followed by that many variable data fields.
+function parseVariableSection(mid, p, pos) {
+  const count = Number(p.slice(pos, pos + 3));
+  if (!/^\d{3}$/.test(p.slice(pos, pos + 3))) {
+    throw new ProtocolError(`MID ${mid}: invalid data field count at offset ${pos}`, mid);
+  }
+  return parseVariableFields(mid, p, pos + 3, count);
+}
+
+// PID → value, for the common case of one value per PID and step.
+function variableValues(fields) {
+  const out = {};
+  for (const f of fields) {
+    const key = f.step ? `${f.pid}.${f.step}` : f.pid;
+    out[key] = f.value;
+  }
+  return out;
+}
+
+// Encode variable data fields. Each field: { pid, value, dataType = 4 (S),
+// unit = 0, step = 0 }. `value` is sent as-is (arrays are joined).
+function encodeVariableFields(fields) {
+  let out = digits(fields.length, 3, 'number of data fields');
+  for (const f of fields) {
+    const dataType = f.dataType ?? 4;
+    const value    = Array.isArray(f.value) ? f.value.map(v => String(v).padStart(8, '0')).join('')
+      : typeof f.value === 'boolean' ? (f.value ? '1' : '0') : String(f.value);
+    out += digits(f.pid, 5, 'PID') + digits(value.length, 3, 'value length') +
+      digits(dataType, 2, 'data type') + digits(f.unit ?? 0, 3, 'unit') +
+      digits(f.step ?? 0, 4, 'step') + value;
+  }
+  return out;
+}
+
+// Fixed-width ASCII text field, right-padded with spaces.
+function text(value, width, name) {
+  const s = String(value ?? '');
+  if (s.length > width) throw new RangeError(`${name} must be at most ${width} characters`);
+  return s.padEnd(width, ' ');
+}
+
+// Cursor over fixed-width fields of an untagged MID.
+class Reader {
+  constructor(mid, p, pos = 0) { this.mid = mid; this.p = p; this.pos = pos; }
+  take(width, name) {
+    const v = this.p.slice(this.pos, this.pos + width);
+    if (v.length < width) throw new ProtocolError(`MID ${this.mid}: ${name} truncated at offset ${this.pos}`, this.mid);
+    this.pos += width;
+    return v;
+  }
+  int(width, name) {
+    const v = this.take(width, name);
+    if (v.trim() && !/^\s*-?\d+\s*$/.test(v)) {
+      throw new ProtocolError(`MID ${this.mid}: ${name} "${v}" is not a number at offset ${this.pos - width}`, this.mid);
+    }
+    return toNumber(v);
+  }
+  str(width, name)  { return this.take(width, name).trim(); }
+  vars()            { const r = parseVariableSection(this.mid, this.p, this.pos); this.pos = r.pos; return r.fields; }
+  get rest()        { return this.p.slice(this.pos); }
+}
+
+const PM_STATUS = { 0: 'OK', 1: 'OKR', 2: 'NOK', 3: 'TERMNOK' };
+const IDENTIFIER_STATUS = { 0: 'notAccepted', 1: 'accepted', 2: 'bypassed', 3: 'reset', 4: 'next', 5: 'initial' };
+
+// PowerMACS special values: Name(20) Type(2) Length(2) Value(Length) [Step(2)].
+function readSpecialValues(r, withStep) {
+  const n = r.int(2, 'number of special values');
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const name  = r.str(20, 'special value name');
+    const type  = r.take(2, 'special value type').trim();
+    const raw   = r.take(r.int(2, 'special value length'), 'special value');
+    const value = type === 'I' || type === 'F' ? toNumber(raw) : raw.trim();
+    const v = { name, type, value };
+    if (withStep) v.step = r.int(2, 'step number');
+    out.push(v);
+  }
+  return out;
+}
+
+// ASCII hex user data for MID 0240/0245: an even number of hex digits.
+function checkHex(hex, max) {
+  const s = String(hex);
+  if (!/^([0-9a-fA-F]{2})+$/.test(s) || s.length > max) {
+    throw new RangeError(`user data must be 2-${max} hex digits, an even count`);
+  }
+  return s;
+}
+
+// MID 0254/0255 data: revision 1 has 8 fixed positions, revision 2 one per socket.
+function selectorLights(deviceId, commands, revision) {
+  if (commands.some(c => ![0, 1, 2].includes(c))) throw new RangeError('light commands are 0, 1 or 2');
+  if (revision < 2) {
+    if (commands.length !== 8) throw new RangeError('revision 1 takes exactly 8 positions');
+    return '01' + digits(deviceId, 2, 'deviceId') + '02' + commands.join('');
+  }
+  return '01' + digits(deviceId, 2, 'deviceId') + '02' + digits(commands.length, 2, 'number of sockets') +
+    '03' + commands.join('');
+}
+
+/* -------------------- MID 2500 / 2501 program tree -------------------- */
+
+const NODE_TYPES = {
+  1: 'Parameter Set', 2: 'Multistage', 3: 'Job', 100: 'Tightening program',
+  101: 'Tightening Step', 102: 'Restriction', 103: 'Check', 104: 'Speed ramp',
+  105: 'Monitoring', 201: 'Multistep tightening program'
+};
+
+// Depth-first node list: NodeType(3) Params(3+fields) Children(2) [JSON(4+n) at rev 2].
+function parseProgramTree(mid, p, rev) {
+  const r = new Reader(mid, p);
+  const readNode = () => {
+    const nodeType = r.int(3, 'node type');
+    const node = { nodeType, nodeTypeName: NODE_TYPES[nodeType] || null, parameters: r.vars() };
+    const childCount = r.int(2, 'number of children');
+    if (rev >= 2) {
+      const len = r.int(4, 'JSON length');
+      if (len) {
+        const json = r.take(len, 'JSON string');
+        try { node.json = JSON.parse(json); } catch (_) { node.json = json; }
+      }
+    }
+    node.children = [];
+    for (let i = 0; i < childCount; i++) node.children.push(readNode());
+    return node;
+  };
+  return readNode();
+}
+
+function encodeProgramTree(node, rev) {
+  const children = node.children || [];
+  let out = digits(node.nodeType, 3, 'node type') + encodeVariableFields(node.parameters || []) +
+    digits(children.length, 2, 'number of children');
+  if (rev >= 2) {
+    const json = node.json === undefined ? '' : typeof node.json === 'string' ? node.json : JSON.stringify(node.json);
+    out += digits(json.length, 4, 'JSON length') + json;
+  }
+  for (const c of children) out += encodeProgramTree(c, rev);
+  return out;
+}
+
+/* -------------------- MID 0900 trace samples -------------------- */
+
+const TRACE_TYPES = { 1: 'angle', 2: 'torque', 3: 'current', 4: 'gradient', 5: 'stroke', 6: 'force' };
+
+// Generic "send alternatives" extra data shared by MID 0900 and 1201
+// subscriptions (Tables 127 and 210).
+function encodeSendAlternative({ sendAlternative = 0, timestamp = null, index = 0, from = 0, to = 0 } = {}) {
+  const alt = digits(sendAlternative, 1, 'send alternative');
+  if (sendAlternative >= 3) return alt + digits(from, 10, 'from') + digits(to, 10, 'to');
+  // Alternative 0 sends the unused identifiers as spaces (spec p.285 example).
+  if (sendAlternative === 0) return alt + ' '.repeat(29);
+  const ts = timestamp ? text(timestamp, 19, 'timestamp') : '0'.repeat(19);
+  return alt + ts + digits(index, 10, 'index');
+}
+
+/* =========================================================
    State Factory
    ========================================================= */
 
@@ -875,6 +1099,7 @@ function createInitialState() {
       info:             null,       // parsed MID 0002
       mode:             null,       // 'automatic' | 'manual' (MID 0401)
       commandsDisabled: null,       // MID 0421
+      selectedMode:     null,       // MID 2604
       time:             null        // MID 0081
     },
 
@@ -979,7 +1204,8 @@ class OpenProtocolNutrunner extends EventEmitter {
     maxRevision            = null,
     communicationRevision  = 1,
     linkLevelAck           = false,
-    commandTimeout         = COMMAND_TIMEOUT_MS
+    commandTimeout         = COMMAND_TIMEOUT_MS,
+    powerMacsBoltData      = true
   }) {
     super();
     this.host                   = host;
@@ -989,6 +1215,8 @@ class OpenProtocolNutrunner extends EventEmitter {
     this.configuredSpindleCount = spindleCount;
     this.allowDuplicateCommands = allowDuplicateCommands;
     this.commandTimeout         = commandTimeout;
+    // MID 0108 "Bolt data" flag: ask PowerMACS for the MID 0107 bolt results.
+    this.powerMacsBoltData      = powerMacsBoltData;
 
     const baseProfile = BRAND_PROFILES[brand] || BRAND_PROFILES['generic'];
     this.profile = {
@@ -1022,6 +1250,7 @@ class OpenProtocolNutrunner extends EventEmitter {
     this._active        = null;     // the one outstanding command (§3.2.1)
     this._keepAliveTs   = null;     // when an unanswered MID 9999 was sent
     this._parts         = new Map();// multi-part reassembly by MID
+    this._operation     = null;     // MID 1201 waiting for its MID 1202s
     this._resetLink();
   }
 
@@ -1203,8 +1432,12 @@ class OpenProtocolNutrunner extends EventEmitter {
 
     if (!expectAck) { this._send(mid, payload, revision); return; }
 
+    // Generic MID 0006/0008/0009 commands are distinct per data MID.
+    const replyMid = opts.replyMid !== undefined ? opts.replyMid : (REPLY_FOR[mid] ?? null);
+    const ackMid   = opts.ackMid ?? mid;
     if (!this.allowDuplicateCommands) {
-      const busy = (this._active && this._active.mid === mid) || this._queue.some(c => c.mid === mid);
+      const same = c => c.mid === mid && c.ackMid === ackMid && c.replyMid === replyMid;
+      const busy = (this._active && same(this._active)) || this._queue.some(same);
       if (busy && !opts.front) {
         throw new CommandError(`Command MID ${mid} already pending - wait for ACK or NAK`, mid);
       }
@@ -1215,8 +1448,8 @@ class OpenProtocolNutrunner extends EventEmitter {
     const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
     const cmd = {
       id: cmdId, mid, payload, revision,
-      replyMid:  opts.replyMid !== undefined ? opts.replyMid : (REPLY_FOR[mid] ?? null),
-      ackMid:    opts.ackMid ?? mid,
+      replyMid,
+      ackMid,
       timestamp: Date.now(), resolve, reject, timeout: null
     };
 
@@ -1470,7 +1703,8 @@ class OpenProtocolNutrunner extends EventEmitter {
   _ackPush(mid) {
     if (this._link.enabled) return;
     if (this._active && this._active.replyMid === mid) return;   // a request reply
-    if (PUSH_ACK[mid]) this._send(PUSH_ACK[mid], '', 1);
+    if (PUSH_ACK[mid] === 108) this._send(108, this.powerMacsBoltData ? '1' : '0', 1);
+    else if (PUSH_ACK[mid]) this._send(PUSH_ACK[mid], '', 1);
     else if (PUSH_ACK_0005.has(mid)) this._send(5, String(mid).padStart(4, '0'), 1);
   }
 
@@ -1612,6 +1846,37 @@ class OpenProtocolNutrunner extends EventEmitter {
       case 421:
         return { commandsDisabled: p[0] === '1' };
 
+      case 67:   return this._parse0067(p);
+      case 106:  return this._parse0106(p, rev);
+      case 107:  return this._parse0107(p, rev);
+      case 152:  return this._parse0152(p);
+      case 242:  return { userData: p.trim(), bytes: Buffer.from(p.trim(), 'hex') };
+      case 251: {
+        const { fields } = parseTagged(251, p, [
+          ['01', 'deviceId', 2, 'int'], ['02', 'numberOfSockets', 2, 'int'],
+          ['03', 'sockets', f => f.numberOfSockets || 0, 'raw']
+        ]);
+        fields.sockets = (fields.sockets || '').split('').map(c => c === '1');
+        return fields;
+      }
+      case 262:  return this._parse0262(p);
+      case 301:  return this._parse0301(p);
+      case 501:  return parseTagged(501, p, [['01', 'motorTuneOk', 1, 'bool']]).fields;
+      case 700:
+      case 702:
+      case 1900: return this._parseVariableOnly(mid, p);
+      case 701:  return this._parse0701(p);
+      case 900:  return this._parse0900(p, rev);
+      case 901:  return this._parse0901(p, rev);
+      case 1000: return this._parse1000(p);
+      case 1201: return this._parse1201(p, rev);
+      case 1202: return this._parse1202(p, rev);
+      case 1601: return this._parse1601(p);
+      case 2501: return { revision: rev || 1, program: parseProgramTree(2501, p, rev || 1) };
+      case 2601: return this._parse2601(p);
+      case 2603: return this._parse2603(p);
+      case 2604: return { modeId: toNumber(p.slice(0, 4)), lastChange: p.slice(4, 23).trim(), numberOfBolts: toNumber(p.slice(23, 26)) };
+
       default:
         return { raw: p };
     }
@@ -1675,6 +1940,327 @@ class OpenProtocolNutrunner extends EventEmitter {
     });
     fields.revision = rev || 1;
     return fields;
+  }
+
+  /* -------------------- untagged / variable-data MIDs -------------------- */
+
+  // MID 0067: tightening result list (reply to MID 0006).
+  _parse0067(p) {
+    const r = new Reader(67, p);
+    const count = r.int(3, 'number of results');
+    const results = [];
+    for (let i = 0; i < count; i++) {
+      results.push({ index: r.int(10, 'index'), startTime: r.str(19, 'start time'), ok: r.take(1, 'status') === '1' });
+    }
+    return { count, results };
+  }
+
+  // MID 0106: PowerMACS station result (rev 1-4). Tagged, with a repeated
+  // bolt group (13-22) and special values (23); rev 4 adds 24 system subtype.
+  _parse0106(p, rev) {
+    const r = new Reader(106, p);
+    const tag = id => {
+      const got = r.take(2, `parameter ${id}`);
+      if (got !== id) throw new ProtocolError(`MID 0106: expected parameter ${id}, got "${got}"`, 106);
+    };
+    const d = { revision: rev || 1 };
+    tag('01'); d.totalMessages = r.int(2, 'total messages');
+    tag('02'); d.messageNumber = r.int(2, 'message number');
+    tag('03'); d.dataNoSystem  = r.int(10, 'data no system');
+    tag('04'); d.stationNo     = r.int(2, 'station no');
+    tag('05'); d.stationName   = r.str(20, 'station name');
+    tag('06'); d.timestamp     = r.str(19, 'time');
+    tag('07'); d.modeNo        = r.int(2, 'mode no');
+    tag('08'); d.modeName      = r.str(20, 'mode name');
+    tag('09'); d.ok            = r.take(1, 'simple status') === '1';
+    tag('10'); d.pmStatus      = PM_STATUS[r.take(1, 'PM status')] ?? null;
+    tag('11'); d.wpId          = r.str(40, 'Wp. Id');
+    tag('12'); const n         = r.int(2, 'number of bolts');
+    d.bolts = [];
+    for (let i = 0; i < n; i++) {
+      const b = {};
+      tag('13'); b.ordinal        = r.int(2, 'ordinal bolt number');
+      tag('14'); b.ok             = r.take(1, 'bolt status') === '1';
+      tag('15'); b.torqueStatus   = toNumber(r.take(1, 'torque status'));
+      tag('16'); b.angleStatus    = toNumber(r.take(1, 'angle status'));
+      tag('17'); b.torque         = toNumber(r.take(7, 'bolt T'));
+      tag('18'); b.angle          = toNumber(r.take(7, 'bolt A'));
+      tag('19'); b.torqueHigh     = toNumber(r.take(7, 'bolt T high'));
+      tag('20'); b.torqueLow      = toNumber(r.take(7, 'bolt T low'));
+      tag('21'); b.angleHigh      = toNumber(r.take(7, 'bolt A high'));
+      tag('22'); b.angleLow       = toNumber(r.take(7, 'bolt A low'));
+      d.bolts.push(b);
+    }
+    tag('23'); d.specialValues = readSpecialValues(r, false);
+    if (r.rest.trim() && r.rest.startsWith('24')) { tag('24'); d.systemSubtype = r.int(3, 'system subtype'); }
+    return d;
+  }
+
+  // MID 0107: PowerMACS bolt result (rev 1-4).
+  _parse0107(p, rev) {
+    const r = new Reader(107, p);
+    const tag = id => {
+      const got = r.take(2, `parameter ${id}`);
+      if (got !== id) throw new ProtocolError(`MID 0107: expected parameter ${id}, got "${got}"`, 107);
+    };
+    const value7 = (type, v) => (type.trim() === 'I' || type.trim() === 'F') ? toNumber(v) : v.trim();
+    const d = { revision: rev || 1 };
+    tag('01'); d.totalMessages     = r.int(2, 'total messages');
+    tag('02'); d.messageNumber     = r.int(2, 'message number');
+    tag('03'); d.dataNoSystem      = r.int(10, 'data no system');
+    tag('04'); d.stationNo         = r.int(2, 'station no');
+    tag('05'); d.timestamp         = r.str(19, 'time');
+    tag('06'); d.boltNumber        = r.int(4, 'bolt number');
+    tag('07'); d.boltName          = r.str(20, 'bolt name');
+    tag('08'); d.programName       = r.str(20, 'program name');
+    tag('09'); d.pmStatus          = PM_STATUS[r.take(1, 'PM status')] ?? null;
+    tag('10'); d.errors            = r.str(50, 'errors');
+    tag('11'); d.customerErrorCode = r.str(4, 'customer error code');
+    tag('12'); const nb = r.int(2, 'number of bolt results');
+    d.boltResults = [];
+    for (let i = 0; i < nb; i++) {
+      const name = r.str(20, 'variable name'); const type = r.take(2, 'type');
+      d.boltResults.push({ name, type: type.trim(), value: value7(type, r.take(7, 'value')) });
+    }
+    tag('13'); const ns = r.int(3, 'number of step results');
+    tag('14'); d.allStepDataSent = r.take(1, 'all step data sent') === '1';
+    d.stepResults = [];
+    for (let i = 0; i < ns; i++) {
+      const name = r.str(20, 'variable name'); const type = r.take(2, 'type');
+      const value = value7(type, r.take(7, 'value'));
+      d.stepResults.push({ name, type: type.trim(), value, step: r.int(2, 'step number') });
+    }
+    tag('15'); d.specialValues = readSpecialValues(r, true);
+    if (r.rest.trim() && r.rest.startsWith('16')) { tag('16'); d.systemSubtype = r.int(3, 'system subtype'); }
+    return d;
+  }
+
+  // MID 0152: four identifier result parts, 30 bytes each (Table 167).
+  _parse0152(p) {
+    const r = new Reader(152, p);
+    const parts = [];
+    for (let i = 1; i <= 4 && r.rest.length >= 32; i++) {
+      r.take(2, 'parameter ID');
+      parts.push({
+        identifierType:      r.int(1, 'identifier type'),
+        includedInWorkOrder: r.int(2, 'included in work order') === 1,
+        status:              IDENTIFIER_STATUS[r.int(2, 'status')] ?? null,
+        resultPart:          r.str(25, 'result part')
+      });
+    }
+    return { parts };
+  }
+
+  // MID 0262: tool tag ID, 8 hex digits; "3200078D" reads "50-0-7-141".
+  _parse0262(p) {
+    const { fields } = parseTagged(262, p, [['01', 'toolTagId', 8, 'str']]);
+    const hex = fields.toolTagId;
+    fields.toolTagIdDecoded = /^[0-9a-fA-F]{8}$/.test(hex)
+      ? hex.match(/../g).map(h => parseInt(h, 16)).join('-') : null;
+    return fields;
+  }
+
+  // MID 0301: histogram (9 bars).
+  _parse0301(p) {
+    const table = [
+      ['01', 'paramSetId', 3, 'int'], ['02', 'histogramType', 2, 'int'],
+      ['03', 'sigma', 6, 'x100'], ['04', 'mean', 6, 'x100'], ['05', 'classRange', 6, 'x100']
+    ];
+    for (let i = 1; i <= 9; i++) table.push([String(5 + i).padStart(2, '0'), `bar${i}`, 4, 'int']);
+    const { fields } = parseTagged(301, p, table);
+    fields.bars = [];
+    for (let i = 1; i <= 9; i++) { fields.bars.push(fields[`bar${i}`]); delete fields[`bar${i}`]; }
+    return fields;
+  }
+
+  // MID 0701: tool list (reply to MID 0006).
+  _parse0701(p) {
+    const r = new Reader(701, p);
+    const count = r.int(3, 'number of tools');
+    const tools = [];
+    for (let i = 0; i < count; i++) {
+      tools.push({
+        toolNumber:    r.int(4, 'tool number'),
+        serialNumber:  r.str(30, 'serial number'),
+        modelName:     r.str(30, 'model name'),
+        articleNumber: r.str(30, 'article number')
+      });
+    }
+    return { tools };
+  }
+
+  // A data field that is only a variable data section (MID 0700, 0702, 1900).
+  _parseVariableOnly(mid, p) {
+    const { fields } = parseVariableSection(mid, p, 0);
+    return { fields, values: variableValues(fields) };
+  }
+
+  /**
+   * MID 0900: trace curve (rev 1-3). The text part ends with a NUL, then
+   * `numberOfSamples` 2-byte binary samples. The byte order is not stated
+   * in the spec; samples are read as signed big-endian 16-bit integers.
+   * Physical values use the coefficient PID 02213 (divide) or 02214
+   * (multiply) when the controller sends one.
+   */
+  _parse0900(p, rev) {
+    const r = new Reader(900, p);
+    const d = { revision: rev || 1 };
+    d.resultDataId = r.int(10, 'result data identifier');
+    d.timestamp    = r.str(19, 'time stamp');
+    if (d.revision >= 3) {
+      d.objectId          = r.int(4, 'object ID');
+      d.objectType        = r.int(1, 'object type');
+      d.referenceObjectId = r.int(4, 'reference object ID');
+    }
+    d.fields         = r.vars();
+    d.traceType      = r.int(2, 'trace type');
+    d.traceTypeName  = TRACE_TYPES[d.traceType] || null;
+    if (d.revision >= 3) d.numberOfTraces = r.int(2, 'number of traces');
+    d.transducerType = r.int(2, 'transducer type');
+    d.unit           = r.int(3, 'unit');
+    if (d.revision >= 2) d.requestMid = r.int(4, 'request MID');
+    d.traceFields    = r.vars();
+
+    const nRes = r.int(3, 'number of resolution fields');
+    d.resolutions = [];
+    for (let i = 0; i < nRes; i++) {
+      const firstIndex = r.int(5, 'first index');
+      const lastIndex  = r.int(5, 'last index');
+      const length     = r.int(3, 'length');
+      const dataType   = r.int(2, 'data type');
+      const unit       = r.int(3, 'unit');
+      d.resolutions.push({ firstIndex, lastIndex, dataType, unit, value: convertVariable(r.take(length, 'time value'), dataType) });
+    }
+
+    d.numberOfSamples = r.int(5, 'number of trace samples');
+    if (r.take(1, 'NUL separator') !== '\0') {
+      throw new ProtocolError('MID 0900: missing NUL before trace samples', 900);
+    }
+    const bin = Buffer.from(r.take(2 * d.numberOfSamples, 'trace samples'), 'latin1');
+    d.samples = [];
+    for (let i = 0; i < d.numberOfSamples; i++) d.samples.push(bin.readInt16BE(2 * i));
+
+    const all  = [...d.fields, ...d.traceFields];
+    const div  = all.find(f => f.pid === '02213');
+    const mul  = all.find(f => f.pid === '02214');
+    d.coefficient = div ? { pid: '02213', value: div.value } : mul ? { pid: '02214', value: mul.value } : null;
+    d.values = div && div.value ? d.samples.map(s => s / div.value)
+      : mul ? d.samples.map(s => s * mul.value) : null;
+    return d;
+  }
+
+  // MID 0901: trace plot parameters (rev 1-3).
+  _parse0901(p, rev) {
+    const r = new Reader(901, p);
+    const d = { revision: rev || 1 };
+    d.resultDataId = r.int(10, 'result data identifier');
+    d.timestamp    = r.str(19, 'time stamp');
+    const count    = r.int(3, 'number of PIDs');
+    if (d.revision >= 2) d.requestMid = r.int(4, 'request MID');
+    if (d.revision >= 3) {
+      d.objectId          = r.int(4, 'object ID');
+      d.objectType        = r.int(1, 'object type');
+      d.referenceObjectId = r.int(4, 'reference object ID');
+      d.traceType         = r.int(2, 'trace type');
+      d.traceTypeName     = TRACE_TYPES[d.traceType] || null;
+    }
+    const { fields } = parseVariableFields(901, p, r.pos, count);
+    d.fields = fields;
+    d.values = variableValues(fields);
+    return d;
+  }
+
+  // MID 1000: alarm with variable data (replaces MID 0071).
+  _parse1000(p) {
+    const r = new Reader(1000, p);
+    const d = { alarmCode: r.str(5, 'alarm code'), timestamp: r.str(19, 'time') };
+    d.fields = r.vars();
+    d.values = variableValues(d.fields);
+    if (d.values['01700'] !== undefined) d.alarmText = d.values['01700'];
+    if (d.values['01701'] !== undefined) d.severity  = d.values['01701'];
+    if (d.values['10100'] !== undefined) d.controllerReady = d.values['10100'];
+    if (d.values['10101'] !== undefined) d.toolReady       = d.values['10101'];
+    return d;
+  }
+
+  // MID 1201: operation result overall data (rev 1-3).
+  _parse1201(p, rev) {
+    const r = new Reader(1201, p);
+    const d = { revision: rev || 1 };
+    d.totalMessages = r.int(3, 'total no of messages');
+    d.messageNumber = r.int(3, 'message number');
+    d.resultDataId  = r.int(10, 'result data identifier');
+    d.timestamp     = r.str(19, 'time');
+    d.ok            = r.take(1, 'result status') === '1';
+    d.operationType = r.int(2, 'operation type');
+    if (d.revision >= 2) d.requestMid = r.int(4, 'request MID');
+    const n = r.int(3, 'number of objects');
+    d.objects = [];
+    for (let i = 0; i < n; i++) {
+      const o = { objectId: r.int(4, 'object ID'), ok: r.take(1, 'object status') === '1' };
+      if (d.revision >= 3) {
+        o.objectType        = r.int(1, 'object type');
+        o.referenceObjectId = r.int(4, 'reference object ID');
+      }
+      d.objects.push(o);
+    }
+    d.fields = r.vars();
+    d.values = variableValues(d.fields);
+    return d;
+  }
+
+  // MID 1202: operation result object data (rev 1-2).
+  _parse1202(p, rev) {
+    const r = new Reader(1202, p);
+    const d = { revision: rev || 1 };
+    d.totalMessages = r.int(3, 'total no of messages');
+    d.messageNumber = r.int(3, 'message number');
+    d.resultDataId  = r.int(10, 'result data identifier');
+    d.objectId      = r.int(4, 'object ID');
+    if (d.revision >= 2) d.nodeGuid = r.str(36, 'node GUID');
+    d.fields = r.vars();
+    d.values = variableValues(d.fields);
+    return d;
+  }
+
+  // MID 1601: dynamic identifiers.
+  _parse1601(p) {
+    const r = new Reader(1601, p);
+    const d = {
+      totalMessages: r.int(3, 'total no of messages'),
+      messageNumber: r.int(3, 'message number'),
+      formatType:    r.int(1, 'format type')
+    };
+    d.fields = r.vars();
+    d.values = variableValues(d.fields);
+    return d;
+  }
+
+  // MID 2601: mode ID list.
+  _parse2601(p) {
+    const r = new Reader(2601, p);
+    const n = r.int(3, 'number of modes');
+    const modes = [];
+    for (let i = 0; i < n; i++) {
+      const modeId = r.int(4, 'mode ID');
+      modes.push({ modeId, name: r.take(r.int(2, 'mode name size'), 'mode name') });
+    }
+    return { modes };
+  }
+
+  // MID 2603: mode data.
+  _parse2603(p) {
+    const r = new Reader(2603, p);
+    const d = { modeId: r.int(4, 'mode ID') };
+    d.name = r.take(r.int(2, 'mode name size'), 'mode name');
+    const n = r.int(3, 'number of bolts');
+    d.bolts = [];
+    for (let i = 0; i < n; i++) {
+      const b = { paramSetId: r.int(3, 'pset'), toolNumber: r.int(3, 'tool number'), boltNumber: r.int(4, 'bolt number') };
+      b.name = r.take(r.int(2, 'bolt name size'), 'bolt name');
+      d.bolts.push(b);
+    }
+    return d;
   }
 
   _normalizeResult(fields, revision) {
@@ -1980,9 +2566,75 @@ class OpenProtocolNutrunner extends EventEmitter {
         this.emit('commandsDisabled', d);
         break;
 
+      case 67:   this.emit('tighteningResultList', d); break;
+      case 106:  this.emit('powerMacsResult', d); break;
+      case 107:  this.emit('powerMacsBoltResult', d); break;
+
+      // MID 0121-0124: job line control events (ACK 0125).
+      case 121: case 122: case 123: case 124:
+        this.emit('jobLineControl', { event: { 121: 'started', 122: 'alert1', 123: 'alert2', 124: 'done' }[mid] });
+        break;
+
+      case 152:  this.emit('identifierResultParts', d); break;
+      case 242:  this.emit('userData', d); break;
+      case 251:
+      case 1900: this.emit('selectorSocketInfo', { mid, ...d }); break;
+      case 262:  this.emit('toolTagId', d); break;
+      case 301:  this.emit('histogram', d); break;
+      case 501:  this.emit('motorTuningResult', d); break;
+      case 700:  this.emit('toolDataDownloadStatus', d); break;
+      case 701:  this.emit('toolList', d); break;
+      case 702:  this.emit('toolGenericData', d); break;
+      case 900:  this.emit('trace', d); break;
+      case 901:  this.emit('tracePlotParameters', d); break;
+
+      // MID 1000: alarm with variable data; replaces MID 0071.
+      case 1000:
+        this.state.controller.alarms.push(d);
+        this.state.controller.errorActive = true;
+        this.state.controller.errorCode   = d.alarmCode;
+        if (d.controllerReady !== undefined) this.state.controller.ready = d.controllerReady;
+        if (d.toolReady !== undefined)       this.state.tool.ready       = d.toolReady;
+        this.emit('alarm', { mid: 1000, ...d });
+        break;
+
+      // MID 1201 + one MID 1202 per object make up one operation result.
+      case 1201:
+        this._operation = { ...d, objectData: [] };
+        this.emit('operationResult', d);
+        if (d.messageNumber >= d.totalMessages) this._completeOperation();
+        break;
+
+      case 1202:
+        this.emit('operationResultObject', d);
+        if (this._operation && this._operation.resultDataId === d.resultDataId) {
+          this._operation.objectData.push(d);
+          if (d.messageNumber >= d.totalMessages) this._completeOperation();
+        }
+        break;
+
+      case 1601: this.emit('dynamicIdentifiers', d); break;
+      case 2501: this.emit('tighteningProgram', d); break;
+
+      // MID 2502: the controller wants the program download password (MID 2503).
+      case 2502: this.emit('programPasswordRequest'); break;
+
+      case 2601: this.emit('modeIds', d); break;
+      case 2603: this.emit('modeData', d); break;
+      case 2604:
+        this.state.controller.selectedMode = d.modeId;
+        this.emit('modeSelected', d);
+        break;
+
     }
 
     this.emit('stateChanged', this.getState());
+  }
+
+  _completeOperation() {
+    const op = this._operation;
+    this._operation = null;
+    this.emit('operationResultComplete', op);
   }
 
   // Settles the outstanding command if `mid` answers it (MID 0004/0005 carry
@@ -2480,6 +3132,295 @@ class OpenProtocolNutrunner extends EventEmitter {
   }
 
   /* =======================================================
+     Public API — Results with variable data, traces, PowerMACS
+     ======================================================= */
+
+  // MID 0008 → MID 1201 (+ MID 1202 per object when sendObjectData), ACK 1203.
+  // Options select the send alternative of Table 127.
+  subscribeOperationResults({ revision = 1, sendObjectData = true, ...alt } = {}) {
+    return this.subscribe(1201, revision, encodeSendAlternative(alt) + (sendObjectData ? '1' : '0'));
+  }
+  unsubscribeOperationResults(revision = 1) { return this.unsubscribe(1201, revision); }
+
+  // MID 0006 → MID 1201 (and its MID 1202s). Index 0 = most recent.
+  requestOperationResult(index = 0, revision = 1) {
+    return this.requestData(1201, revision, digits(index, 10, 'index'));
+  }
+
+  // MID 0006 → MID 0067: brief list of stored results.
+  requestTighteningResultList(startIndex = 0, count = 10) {
+    return this.requestData(67, 1, digits(startIndex, 10, 'start index') + digits(count, 3, 'count'));
+  }
+
+  // MID 0008 → MID 0900 trace curves (ACK 0005). traceTypes: 1 angle,
+  // 2 torque, 3 current, 4 gradient, 5 stroke, 6 force (Table 210).
+  subscribeTraces(traceTypes = [2], { revision = 1, ...alt } = {}) {
+    const types = digits(traceTypes.length, 2, 'number of trace types') +
+      traceTypes.map(t => digits(t, 3, 'trace type')).join('');
+    return this.subscribe(900, revision, encodeSendAlternative(alt) + types);
+  }
+
+  // MID 0009 for MID 0900; trace type 999 unsubscribes all (Table 211).
+  unsubscribeTraces(traceTypes = [999], revision = 1) {
+    const types = digits(traceTypes.length, 2, 'number of trace types') +
+      traceTypes.map(t => digits(t, 3, 'trace type')).join('');
+    return this.unsubscribe(900, revision, types);
+  }
+
+  // MID 0006 → MID 0900 / MID 0901 for one stored result (Tables 209, 212).
+  requestTrace(index = 0, traceType = 2, toolNumber = 1, revision = 1) {
+    return this.requestData(900, revision,
+      digits(index, 10, 'index') + digits(traceType, 3, 'trace type') + digits(toolNumber, 4, 'tool number'));
+  }
+  requestTracePlotParameters(index = 0, traceType = 2, toolNumber = 1, revision = 1) {
+    return this.requestData(901, revision,
+      digits(index, 10, 'index') + digits(traceType, 3, 'trace type') + digits(toolNumber, 4, 'tool number'));
+  }
+
+  // MID 0008/0009 → MID 0901 plot parameters; no extra data.
+  subscribeTracePlotParameters(revision = 1) { return this.subscribe(901, revision); }
+  unsubscribeTracePlotParameters(revision = 1) { return this.unsubscribe(901, revision); }
+
+  // MID 0105 → MID 0106 station result (+ MID 0107 per bolt), ACK 0108.
+  // Revision 2+ takes Data No System and "send only new data" (Table 151).
+  subscribePowerMacsResults(revision = 1, { dataNoSystem = 0, onlyNew = false } = {}) {
+    const payload = revision >= 2 ? digits(dataNoSystem, 10, 'dataNoSystem') + (onlyNew ? '1' : '0') : '';
+    return this._subscribe('powerMacsResults', 105, revision, payload);
+  }
+  unsubscribePowerMacsResults() { return this._unsubscribe('powerMacsResults', 109); }
+
+  // MID 0008/0009 → MID 1000 alarms (ACK 1001); replaces MID 0070-0077.
+  subscribeAlarmsV2(revision = 1)   { return this.subscribe(1000, revision); }
+  unsubscribeAlarmsV2(revision = 1) { return this.unsubscribe(1000, revision); }
+
+  /* =======================================================
+     Public API — Identifiers
+     ======================================================= */
+
+  // MID 0150: send an identifier (max 100 characters).
+  downloadIdentifier(identifier) {
+    const s = String(identifier);
+    if (!s.length || s.length > 100) throw new RangeError('identifier must be 1-100 characters');
+    return this.sendMID(150, s, true);
+  }
+
+  // MID 0151 → MID 0152 (ACK 0153).
+  subscribeIdentifierResultParts()   { return this._subscribe('identifierResultParts', 151); }
+  unsubscribeIdentifierResultParts() { return this._unsubscribe('identifierResultParts', 154); }
+
+  bypassIdentifier()      { return this.sendMID(155, '', true); }   // MID 0155
+  resetLatestIdentifier() { return this.sendMID(156, '', true); }   // MID 0156
+  resetAllIdentifiers()   { return this.sendMID(157, '', true); }   // MID 0157
+
+  // MID 0008 → MID 1601 (ACK 1602). sendAlternative 0 = all, 1 = result
+  // related, 2 = the listed PIDs (Table 168).
+  subscribeDynamicIdentifiers({ sendAlternative = 0, formatType = 0, pids = [] } = {}) {
+    let extra = digits(sendAlternative, 1, 'send alternative') + digits(formatType, 1, 'format type');
+    if (sendAlternative === 2) {
+      extra += digits(pids.length, 3, 'number of identifiers') + pids.map(p => digits(p, 5, 'PID')).join('');
+    }
+    return this.subscribe(1601, 1, extra);
+  }
+  unsubscribeDynamicIdentifiers() { return this.unsubscribe(1601, 1); }
+
+  /* =======================================================
+     Public API — Programs and modes
+     ======================================================= */
+
+  // MID 2500: download a tightening program tree. A node is
+  // { nodeType, parameters: [{ pid, value, dataType, unit, step }], children, json }.
+  downloadTighteningProgram(program, revision = 1) {
+    return this.sendMID(2500, encodeProgramTree(program, revision), true, revision);
+  }
+
+  // MID 0006 → MID 2501. programId 0 = all programs of the node type.
+  requestTighteningProgram(programId = 0, nodeType = 1, revision = 1) {
+    return this.requestData(2501, revision, digits(programId, 4, 'program ID') + digits(nodeType, 3, 'node type'));
+  }
+
+  // MID 0008/0009 → MID 2501 on every program change (ACK 0005).
+  subscribeTighteningPrograms(programId = 0, nodeType = 1, revision = 1) {
+    return this.subscribe(2501, revision, digits(programId, 4, 'program ID') + digits(nodeType, 3, 'node type'));
+  }
+  unsubscribeTighteningPrograms(revision = 1) { return this.unsubscribe(2501, revision); }
+
+  // MID 2503: password answer to MID 2502.
+  sendProgramPassword(password) { this.sendMID(2503, String(password)); }
+
+  // MID 2504: select a pset and create a dynamic job containing only it.
+  selectParameterSetDynamicJob(paramSetId) {
+    return this.sendMID(2504, digits(paramSetId, 3, 'paramSetId'), true);
+  }
+
+  // MID 2505: select a dynamic pset derived from paramSetId with changed PIDs.
+  selectParameterSetDynamically(paramSetId, fields = []) {
+    return this.sendMID(2505, digits(paramSetId, 3, 'paramSetId') + encodeVariableFields(fields), true);
+  }
+
+  requestModeIds()        { return this.sendMID(2600, '', true); }                                 // → 2601
+  requestModeData(modeId) { return this.sendMID(2602, digits(modeId, 4, 'mode ID'), true); }        // → 2603
+  selectMode(modeId)      { return this.sendMID(2606, digits(modeId, 4, 'mode ID'), true); }        // MID 2606
+  subscribeModeSelected()   { return this.subscribe(2604); }                                        // ACK 2605
+  unsubscribeModeSelected() { return this.unsubscribe(2604); }
+
+  /* =======================================================
+     Public API — Tools (generic data)
+     ======================================================= */
+
+  // MID 0008/0009 → MID 0700 radio tool download status (ACK 0005).
+  subscribeToolDataDownloadStatus()   { return this.subscribe(700); }
+  unsubscribeToolDataDownloadStatus() { return this.unsubscribe(700); }
+
+  requestToolList() { return this.requestData(701); }                                              // → 0701
+  requestToolGenericData(toolNumber) {                                                             // → 0702
+    return this.requestData(702, 1, '01' + digits(toolNumber, 4, 'tool number'));
+  }
+
+  // MID 0703: set calibration with variable data fields.
+  setCalibrationValueGeneric(toolNumber, fields) {
+    return this.sendMID(703, '01' + digits(toolNumber, 4, 'tool number') + encodeVariableFields(fields), true);
+  }
+
+  // MID 0260 → MID 0262; MID 0261/0264 subscription (ACK 0263).
+  requestToolTagId()     { return this.sendMID(260, '', true); }
+  subscribeToolTagId()   { return this._subscribe('toolTagId', 261); }
+  unsubscribeToolTagId() { return this._unsubscribe('toolTagId', 264); }
+
+  // MID 0265: tool tag ID (8 hex digits) and status 1 operable / 2 inoperable.
+  sendExternalToolTag(toolTagId, status = 1) {
+    if (!/^[0-9a-fA-F]{8}$/.test(toolTagId)) throw new RangeError('toolTagId must be 8 hex digits');
+    return this.sendMID(265, '01' + toolTagId + '02' + digits(status, 2, 'status'), true);
+  }
+
+  // MID 0500 → MID 0501 (ACK 0502); MID 0504 starts a tuning.
+  subscribeMotorTuning(revision = 1) { return this._subscribe('motorTuning', 500, revision); }
+  unsubscribeMotorTuning()           { return this._unsubscribe('motorTuning', 503); }
+  requestMotorTuning()               { return this.sendMID(504, '', true); }
+
+  /* =======================================================
+     Public API — Operator interface, job line control
+     ======================================================= */
+
+  // MID 0110: up to 4 characters on the compact display.
+  displayUserTextCompact(message) { return this.sendMID(110, text(message, 4, 'text'), true); }
+
+  // MID 0111: four 25-character lines on the graphic display.
+  displayUserTextGraph(lines, { duration = 0, acknowledge = false } = {}) {
+    const l = [...lines, '', '', '', ''].slice(0, 4);
+    const payload = '01' + digits(duration, 4, 'duration') + '02' + (acknowledge ? '1' : '0') +
+      l.map((s, i) => String(i + 3).padStart(2, '0') + text(s, 25, `line ${i + 1}`)).join('');
+    return this.sendMID(111, payload, true);
+  }
+
+  // MID 0120 → MID 0121-0124 (ACK 0125).
+  subscribeJobLineControl()   { return this._subscribe('jobLineControl', 120); }
+  unsubscribeJobLineControl() { return this._unsubscribe('jobLineControl', 126); }
+  setJobLineControlStart()    { return this.sendMID(131, '', true); }
+  setJobLineAlert1()          { return this.sendMID(132, '', true); }
+  setJobLineAlert2()          { return this.sendMID(133, '', true); }
+
+  /**
+   * MID 0140: execute a dynamic job (revisions 1-4, 999). Each entry of
+   * `job.list` is { channelId, paramSetId, autoSelect, batchSize,
+   * maxCoherentNok, batchCounter, identifierNumber, stepName, stepType,
+   * toolLoosening, batchMode, batchStatusAtIncrement, decrementAtLoosening,
+   * currentBatchStatus }; the revision decides which are sent (Tables 161-165).
+   */
+  executeDynamicJob(job, revision = 1) {
+    const rev = revision;
+    const list = (job.list || []).map(e => {
+      const f = [digits(e.channelId ?? 1, 2, 'channelId'), digits(e.paramSetId, 3, 'paramSetId'),
+        digits(e.autoSelect ?? 0, rev >= 3 && rev !== 999 ? 2 : 1, 'autoSelect'),
+        digits(e.batchSize ?? 1, rev === 4 ? 4 : 2, 'batchSize'), digits(e.maxCoherentNok ?? 0, 2, 'maxCoherentNok')];
+      if (rev >= 2) f.push(digits(e.batchCounter ?? 0, rev === 4 ? 4 : 2, 'batchCounter'));
+      if (rev >= 2 && rev !== 999) {
+        f.push(digits(e.identifierNumber ?? 0, 4, 'identifierNumber'), text(e.stepName ?? '', 25, 'stepName'),
+          digits(e.stepType ?? 0, 2, 'stepType'));
+      }
+      if (rev >= 3 && rev !== 999) {
+        f.push(digits(e.toolLoosening ?? 0, 1, 'toolLoosening'), digits(e.batchMode ?? 0, 1, 'batchMode'),
+          digits(e.batchStatusAtIncrement ?? 0, 1, 'batchStatusAtIncrement'),
+          digits(e.decrementAtLoosening ?? 0, 1, 'decrementAtLoosening'),
+          digits(e.currentBatchStatus ?? 0, 1, 'currentBatchStatus'));
+      }
+      return f.join(':') + ';';
+    }).join('');
+
+    const flag = v => (v ? '1' : '0');
+    let p = '01' + digits(job.jobId, 4, 'jobId') + '02' + text(job.name ?? '', 25, 'name') +
+      '03' + digits((job.list || []).length, 2, 'number of parameter sets') + '04' + list;
+    const params = rev >= 3 && rev !== 999
+      ? [digits(job.forcedOrder ?? 0, 1, 'forcedOrder'), flag(job.lockAtJobDone), flag(job.repeatJob),
+        digits(job.maxTimeFirstTightening ?? 0, 4, 'maxTimeFirstTightening'),
+        digits(job.maxTimeToComplete ?? 0, 5, 'maxTimeToComplete'),
+        digits(job.displayResultAtAutoSelect ?? 0, 4, 'displayResultAtAutoSelect'),
+        flag(job.useLineControl), digits(job.identifierResultPart ?? 0, 1, 'identifierResultPart'),
+        flag(job.resultOfNonTightenings), flag(job.resetAllIdentifiersAtJobDone), digits(job.reserved ?? 0, 1, 'reserved'),
+        digits(job.jobSequenceNumber ?? 0, 5, 'jobSequenceNumber')]
+      : [digits(job.forcedOrder ?? 0, 1, 'forcedOrder'), flag(job.lockAtJobDone),
+        digits(job.toolLoosening ?? 0, 1, 'toolLoosening'), flag(job.repeatJob),
+        digits(job.batchMode ?? 0, 1, 'batchMode'), digits(job.batchStatusAtIncrement ?? 0, 1, 'batchStatusAtIncrement'),
+        flag(job.decrementAtOkLoosening), digits(job.maxTimeFirstTightening ?? 0, 4, 'maxTimeFirstTightening'),
+        digits(job.maxTimeToComplete ?? 0, 5, 'maxTimeToComplete'),
+        digits(job.displayResultAtAutoSelect ?? 0, 4, 'displayResultAtAutoSelect'),
+        flag(job.useLineControl), digits(job.identifierResultPart ?? 0, 1, 'identifierResultPart'),
+        flag(job.resultOfNonTightenings), flag(job.resetAllIdentifiersAtJobDone), digits(job.reserved ?? 0, 1, 'reserved')]
+        .concat(rev === 2 ? [digits(job.jobSequenceNumber ?? 0, 5, 'jobSequenceNumber')] : []);
+    params.forEach((v, i) => { p += String(i + 5).padStart(2, '0') + v; });
+    return this.sendMID(140, p, true, rev);
+  }
+
+  /* =======================================================
+     Public API — PLC user data, selectors, controller
+     ======================================================= */
+
+  // MID 0240: user data as ASCII hex (2-200 characters).
+  userDataDownload(hex) { return this.sendMID(240, checkHex(hex, 200), true); }
+
+  // MID 0245: user data written at PLC address 13000 + offset.
+  userDataDownloadWithOffset(offset, hex) {
+    return this.sendMID(245, digits(offset, 3, 'offset') + checkHex(hex, 200 - 2 * offset), true);
+  }
+
+  // MID 0241 → MID 0242 (ACK 0243).
+  subscribeUserData()   { return this._subscribe('userData', 241); }
+  unsubscribeUserData() { return this._unsubscribe('userData', 244); }
+
+  // MID 0250 → MID 0251 (ACK 0252).
+  subscribeSelectorSocketInfo()   { return this._subscribe('selectorSocketInfo', 250); }
+  unsubscribeSelectorSocketInfo() { return this._unsubscribe('selectorSocketInfo', 253); }
+
+  // MID 0254 / 0255: selector lights, 0 off, 1 steady, 2 flashing. Revision 1
+  // sends exactly 8 positions; revision 2 sends one per socket.
+  setSelectorGreenLights(deviceId, commands, revision = commands.length === 8 ? 1 : 2) {
+    return this.sendMID(254, selectorLights(deviceId, commands, revision), true, revision);
+  }
+  setSelectorRedLights(deviceId, commands, revision = commands.length === 8 ? 1 : 2) {
+    return this.sendMID(255, selectorLights(deviceId, commands, revision), true, revision);
+  }
+
+  // MID 0008/0009 → MID 1900 selector socket info (ACK 0005).
+  subscribeSelectorSocketInfoV2()   { return this.subscribe(1900); }
+  unsubscribeSelectorSocketInfoV2() { return this.unsubscribe(1900); }
+
+  // MID 1901: selector lights as variable data fields (device specific PIDs).
+  selectorSocketControl(fields) { return this.sendMID(1901, encodeVariableFields(fields), true); }
+
+  // MID 0270: reboot the controller (needs programming control).
+  rebootController() { return this.sendMID(270, '', true); }
+
+  // MID 2100: device command; 0001 reboot, 0002/0003 enter/leave standby.
+  deviceCommand(commandId, fields = []) {
+    return this.sendMID(2100, digits(commandId, 4, 'command ID') + encodeVariableFields(fields), true);
+  }
+
+  // MID 0300 → MID 0301. Types: 0 torque, 1 angle, 2 current, 3 prevail,
+  // 4 self tap, 5 rundown angle.
+  requestHistogram(paramSetId, histogramType = 0) {
+    return this.sendMID(300, '01' + digits(paramSetId, 3, 'paramSetId') + '02' + digits(histogramType, 2, 'histogram type'), true);
+  }
+
+  /* =======================================================
      Public API — Configuration
      ======================================================= */
 
@@ -2519,5 +3460,6 @@ class OpenProtocolNutrunner extends EventEmitter {
 
 module.exports = {
   OpenProtocolNutrunner, InterlockError, ProtocolError, CommandError,
-  ERROR_CODES, PUSH_ACK, REPLY_FOR
+  ERROR_CODES, PUSH_ACK, REPLY_FOR, DATA_TYPES, TRACE_TYPES, NODE_TYPES,
+  encodeVariableFields, parseVariableFields
 };
