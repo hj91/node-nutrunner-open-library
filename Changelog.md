@@ -15,6 +15,21 @@
 - Mock-controller test suite (`npm test`, `node:test`, no dependencies).
 
 ---
+## [Unreleased] - Tightening Result Parsing
+
+### Fixed
+- **MID 0061 layouts follow the spec:** Results are parsed as tagged data for every brand, selected by revision: rev 1 (parameters 01-23), revs 2-7 (01-57), and the untagged rev 999 light layout. The invented positional "standard" rev 1/4 layout and the "compact" rev 2/3 layout are removed. Without a header revision, rev 1 vs rev 2+ is inferred from the data instead of from the negotiated subscription revision.
+- **One MID 0062 per MID 0061:** Every result is acknowledged as soon as it arrives, including results that fail to parse. Withholding the ACK until all spindles reported stalled multi-spindle streams, because the controller sends the next result only after the previous one is acknowledged.
+- **MID 0065 is a reply, not a subscription:** It answers MID 0064, takes no acknowledgement (MID 0066 is *Number of offline results*), uses the tagged layout, and is emitted as `oldTighteningResult` instead of counting toward the live cycle and batch.
+- **MID 0041 is tool data:** It is the tagged *Tool data upload reply* (serial number, tightening count, calibration and service data), stored in `state.tool.data` and emitted as `toolData`. It no longer drives controller ready, tool enabled/running, direction or emergency stop, none of which it carries.
+
+### Changed
+- `controller.ready` is set when the controller answers MID 0001 with MID 0002; `tool.enabled` follows the MID 0005 ACK for the enable/disable MIDs.
+- `tighteningCycleStarted` fires on the first result of a cycle (Open Protocol has no tool-running message).
+
+### Added
+- `requestToolData()` (MID 0040 → 0041) and `requestOldTighteningResult(tighteningId)` (MID 0064 → 0065).
+- Test suite (`npm test`) with golden MID 0041, 0061 and 0065 payloads.
 
 ## [1.2.7] - Real Hardware Multi-Spindle Fix - 2026-05-16
 
