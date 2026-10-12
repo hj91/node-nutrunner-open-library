@@ -32,7 +32,7 @@ STATIONS.forEach(({ id, host, brand }) => {
     console.warn(`[${id}] ⚠ Incomplete cycle: ${received}/${expected} spindles`));
 
   runner.on('alarm', (alarm) =>
-    console.error(`[${id}] 🚨 ALARM ${alarm.alarmCode}: ${alarm.message}`));
+    console.error(`[${id}] 🚨 ALARM ${alarm.alarmCode} at ${alarm.timestamp}${alarm.alarmText ? ': ' + alarm.alarmText : ''}`));
 
   runner.on('reconnecting', ({ attempt }) =>
     console.warn(`[${id}] Reconnect attempt #${attempt}...`));
