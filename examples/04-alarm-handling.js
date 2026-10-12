@@ -12,7 +12,7 @@ const nutrunner = new OpenProtocolNutrunner({
 });
 
 nutrunner.on('alarm', (alarm) => {
-  console.error(`🚨 ALARM [${alarm.alarmCode}]: ${alarm.message}`);
+  console.error(`🚨 ALARM [${alarm.alarmCode}] at ${alarm.timestamp}${alarm.alarmText ? ': ' + alarm.alarmText : ''}`);
   // Auto-acknowledge informational alarm code E001
   if (alarm.alarmCode === 'E001') {
     console.log('  Auto-acknowledging alarm E001...');
@@ -20,9 +20,9 @@ nutrunner.on('alarm', (alarm) => {
   }
 });
 
-nutrunner.on('alarmStatus', ({ alarmStatus, currentAlarms }) => {
-  if (alarmStatus) {
-    console.warn(`  Active alarms: ${currentAlarms.join(', ')}`);
+nutrunner.on('alarmStatus', ({ alarmActive, alarmCode }) => {
+  if (alarmActive) {
+    console.warn(`  Active alarm: ${alarmCode}`);
   } else {
     console.log('✓ All alarms cleared — controller ready');
   }
